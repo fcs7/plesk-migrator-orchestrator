@@ -1,5 +1,25 @@
 # Plano: Orquestrador Plesk Migrator (cPanel → Plesk) via CLI
 
+> **⚠ Documento de decisões iniciais — superseded por `docs/spec.md`.**
+>
+> Após revisão por 3 agentes em paralelo (critic + architect + document-specialist),
+> as seguintes correções foram aplicadas em `docs/spec.md` (fonte-de-verdade
+> para implementação):
+>
+> 1. **`copy-content` não existe** → substituído por três fases (`copy-web-content`,
+>    `copy-mail-content`, `copy-db-content`), conforme documentação oficial Plesk.
+> 2. **Comando de install errado** → `plesk bin extension --install panel-migrator`
+>    não é documentado para esta extensão. Método correto: `plesk installer
+>    --select-release-current --install-component panel-migrator`.
+> 3. **Faltavam:** timeouts por fase, lock file, signal handlers, captura de
+>    stderr com mascaramento, idempotência em `generate-migration-list`,
+>    `preflight_checks()` via comando `plesk-migrator check`, flag
+>    `--cleanup-config` para remover senha pós-migração.
+>
+> Este `plan.md` permanece como registro das decisões macro do usuário
+> (linguagem, layout, auth, formato config). Para detalhes de implementação,
+> use `docs/spec.md`.
+
 ## Estado atual do repositório
 
 - Repo GitHub: https://github.com/fcs7/plesk-migrator-orchestrator (privado)
