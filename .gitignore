@@ -1,0 +1,25 @@
+# OMC metadata
+.omc/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Local config sensitive (template fica em config.example.yaml)
+config.yaml
+config.local.yaml
+*.local.yaml
