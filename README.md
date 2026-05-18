@@ -17,9 +17,15 @@ git clone https://github.com/fcs7/plesk-migrator-orchestrator.git
 cd plesk-migrator-orchestrator
 chmod +x run.sh
 
-sudo cp config.example.yaml /etc/plesk-migration.yaml
-sudo chmod 600 /etc/plesk-migration.yaml
-sudo $EDITOR /etc/plesk-migration.yaml   # preencha source/dest/ssh_password
+# Wizard interativo: pergunta host/senha e grava /etc/plesk-migration.yaml
+# (chmod 600). Senha lida com getpass — não ecoa, aceita paste e UTF-8.
+# Dispara automático se /etc/plesk-migration.yaml não existe:
+sudo ./run.sh
+
+# Ou explicitamente:
+sudo ./run.sh --init
+# Saída em path custom:
+sudo ./run.sh --init --config-out /tmp/teste-migration.yaml
 
 # 1. Sempre rode um dry-run primeiro
 sudo ./run.sh --config /etc/plesk-migration.yaml --dry-run --skip-install
@@ -27,6 +33,9 @@ sudo ./run.sh --config /etc/plesk-migration.yaml --dry-run --skip-install
 # 2. Pipeline completo (janela de manutenção)
 sudo ./run.sh --config /etc/plesk-migration.yaml
 ```
+
+> **Edição manual também funciona.** Se preferir pular o wizard:
+> `sudo cp config.example.yaml /etc/plesk-migration.yaml && sudo chmod 600 /etc/plesk-migration.yaml && sudo $EDITOR /etc/plesk-migration.yaml`
 
 ---
 

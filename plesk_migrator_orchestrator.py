@@ -14,6 +14,7 @@ import argparse
 import configparser
 import datetime as _dt
 import fcntl
+import getpass
 import hashlib
 import json
 import logging
@@ -25,6 +26,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
@@ -2334,6 +2336,286 @@ class PleskMigrationOrchestrator:
 # CLI (§10 spec)
 # ---------------------------------------------------------------------------
 
+def _wizard_confirm(prompt: str, *, default: bool = False) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    try:
+        raw = input(f"{prompt} {suffix}: ").strip().lower()
+    except EOFError:
+        return default
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    if not raw:
+        return default
+    return raw in ("y", "yes", "s", "sim")
+
+
+def _wizard_prompt(
+    label: str,
+    *,
+    default: str | None = None,
+    secret: bool = False,
+    validator: Callable[[str], tuple[bool, str]] | None = None,
+    allow_empty: bool = False,
+) -> str:
+    while True:
+        if default is not None and not secret:
+            shown = f"{label} [{default}]: "
+        else:
+            shown = f"{label}: "
+        try:
+            raw = getpass.getpass(shown) if secret else input(shown)
+        except EOFError:
+            sys.stderr.write("\nAbortado (EOF).\n")
+            raise SystemExit(130)
+        except KeyboardInterrupt:
+            sys.stderr.write("\nAbortado (Ctrl-C).\n")
+            raise SystemExit(130)
+        if not secret:
+            raw = raw.strip()
+        if not raw and default is not None:
+            raw = default
+        if not raw:
+            if allow_empty:
+                return ""
+            print("  Valor vazio não aceito; tente de novo.")
+            continue
+        if validator is not None:
+            ok, msg = validator(raw)
+            if not ok:
+                print(f"  {msg}")
+                continue
+        return raw
+
+
+def _wizard_prompt_secret_confirmed(label: str, *, hint: str = "") -> str:
+    if hint:
+        print(f"  {hint}")
+    while True:
+        try:
+            pwd1 = getpass.getpass(f"{label}: ")
+            pwd2 = getpass.getpass(f"{label} (confirme): ")
+        except EOFError:
+            sys.stderr.write("\nAbortado (EOF).\n")
+            raise SystemExit(130)
+        except KeyboardInterrupt:
+            sys.stderr.write("\nAbortado (Ctrl-C).\n")
+            raise SystemExit(130)
+        if not pwd1:
+            print("  Senha vazia não aceita; tente de novo.")
+            continue
+        if pwd1 != pwd2:
+            print("  Senhas não conferem; tente de novo.")
+            continue
+        return pwd1
+
+
+def _wizard_validate_hostname(value: str) -> tuple[bool, str]:
+    if len(value) > 253:
+        return False, "Hostname acima de 253 caracteres"
+    if not re.match(r"^[A-Za-z0-9._:\-]+$", value):
+        return False, "Hostname só pode conter letras, dígitos, '.', '-', '_', ':'"
+    return True, ""
+
+
+def _wizard_validate_port(value: str) -> tuple[bool, str]:
+    try:
+        port = int(value)
+    except ValueError:
+        return False, "Porta deve ser inteiro"
+    if not (1 <= port <= 65535):
+        return False, "Porta fora do range 1..65535"
+    return True, ""
+
+
+def _wizard_validate_log_dir(value: str) -> tuple[bool, str]:
+    p = pathlib.Path(value)
+    if p.exists():
+        if not p.is_dir():
+            return False, f"{value} existe e não é diretório"
+        if not os.access(value, os.W_OK):
+            return False, f"{value} não é gravável"
+        return True, ""
+    parent = p.parent
+    if not parent.exists():
+        return False, f"Diretório pai {parent} não existe"
+    if not os.access(str(parent), os.W_OK):
+        return False, f"Diretório pai {parent} não é gravável"
+    return True, ""
+
+
+def _run_init_wizard(args: argparse.Namespace) -> int:
+    """Wizard interativo: coleta campos mínimos, gera YAML chmod 600.
+
+    Retorna 0 (sucesso), 1 (erro), 130 (cancelado).
+    """
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        sys.stderr.write(
+            "ERRO: --init requer terminal interativo (stdin/stdout TTY).\n"
+        )
+        return 1
+
+    out_path = pathlib.Path(
+        args.config_out or args.config or "/etc/plesk-migration.yaml"
+    )
+
+    print("=" * 64)
+    print("  Plesk Migrator Orchestrator — wizard de configuração")
+    print("=" * 64)
+    print(f"Arquivo de saída: {out_path}")
+    if os.geteuid() != 0 and str(out_path).startswith("/etc/"):
+        print("AVISO: você não é root; escrita em /etc/ pode falhar.")
+    print()
+
+    backup_path: pathlib.Path | None = None
+    if out_path.exists():
+        if not _wizard_confirm(
+            f"{out_path} já existe — sobrescrever?", default=False
+        ):
+            print("Cancelado pelo usuário.")
+            return 0
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = pathlib.Path(f"{out_path}.bak.{ts}")
+        print(f"Backup automático → {backup_path}")
+        print()
+
+    print("[1/3] Origem cPanel")
+    src_host = _wizard_prompt(
+        "  IP/hostname do servidor cPanel",
+        validator=_wizard_validate_hostname,
+    )
+    src_port = _wizard_prompt(
+        "  Porta SSH", default="22", validator=_wizard_validate_port,
+    )
+    print()
+    src_password = _wizard_prompt_secret_confirmed(
+        "  Senha root SSH do cPanel",
+        hint=(
+            "Cole ou digite a senha — caracteres NÃO aparecem na tela. "
+            "Aceita qualquer caracter (espaços, !@#$%, UTF-8)."
+        ),
+    )
+    src_pg = _wizard_prompt(
+        "  Senha PostgreSQL origem (Enter para pular)",
+        default="", secret=True, allow_empty=True,
+    )
+
+    print("\n[2/3] Destino Plesk")
+    dst_host = _wizard_prompt(
+        "  IP/hostname do destino", default="127.0.0.1",
+        validator=_wizard_validate_hostname,
+    )
+
+    print("\n[3/3] Paths (Enter aceita default)")
+    log_dir = _wizard_prompt(
+        "  Diretório de log",
+        default="/var/log/plesk-migration-orchestrator",
+        validator=_wizard_validate_log_dir,
+    )
+
+    data: dict = {
+        "source": {
+            "host": src_host,
+            "ssh_port": int(src_port),
+            "ssh_password": src_password,
+        },
+        "dest": {"host": dst_host},
+        "paths": {"log_dir": log_dir},
+    }
+    if src_pg:
+        data["source"]["postgres_password"] = src_pg
+
+    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    header = (
+        f"# Plesk Migrator Orchestrator — gerado por --init em {now}\n"
+        f"# chmod 600 (contém senha em texto plano)\n"
+        f"# Campos avançados (migration.*, behavior.*, paths.plesk_bin):\n"
+        f"# ver config.example.yaml na raiz do repositório.\n"
+        f"#\n"
+        f"# Próximo passo (dry-run, não-destrutivo):\n"
+        f"#   sudo ./run.sh --config {out_path} --dry-run --skip-install\n"
+        f"\n"
+    )
+    body = yaml.safe_dump(
+        data, default_flow_style=False, sort_keys=False, allow_unicode=True,
+    )
+
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        sys.stderr.write(f"ERRO: diretório pai inacessível: {exc}\n")
+        return 1
+
+    # Grava atômico para evitar TOCTOU em /tmp e similares: cria arquivo
+    # novo via mkstemp (mode 600 garantido por umask + fchmod ANTES do
+    # write), depois rename. Symlink racing em out_path não atinge a senha.
+    payload = (header + body).encode("utf-8")
+    old_umask = os.umask(0o077)
+    tmp_fd = -1
+    tmp_name = ""
+    try:
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            prefix=out_path.name + ".",
+            suffix=".tmp",
+            dir=str(out_path.parent),
+        )
+        os.fchmod(tmp_fd, 0o600)
+        os.write(tmp_fd, payload)
+        os.fsync(tmp_fd)
+        os.close(tmp_fd)
+        tmp_fd = -1
+        if backup_path is not None:
+            try:
+                os.replace(str(out_path), str(backup_path))
+            except OSError as exc:
+                sys.stderr.write(f"ERRO: backup falhou: {exc}\n")
+                try: os.unlink(tmp_name)
+                except OSError: pass
+                return 1
+        os.replace(tmp_name, str(out_path))
+        tmp_name = ""
+    except OSError as exc:
+        sys.stderr.write(f"ERRO: gravação falhou: {exc}\n")
+        if tmp_fd >= 0:
+            try: os.close(tmp_fd)
+            except OSError: pass
+        if tmp_name:
+            try: os.unlink(tmp_name)
+            except OSError: pass
+        return 1
+    finally:
+        os.umask(old_umask)
+
+    print(f"\n✓ Gravado: {out_path} (chmod 600)")
+
+    try:
+        cfg = _load_config(str(out_path))
+    except ValidationError as exc:
+        sys.stderr.write(f"ERRO: YAML gerado falhou no parse: {exc}\n")
+        return 1
+    # Reusa _validate_config (não-instanciado): stub minimal só com .config.
+    # Evita side-effects do __init__ (logger, log dir, discovery).
+    class _StubForValidation:
+        pass
+    stub = _StubForValidation()
+    stub.config = cfg
+    try:
+        PleskMigrationOrchestrator._validate_config(stub)
+    except ValidationError as exc:
+        sys.stderr.write(
+            f"ERRO: validação completa falhou: {exc}\n"
+            f"O YAML foi gravado em {out_path} mas precisa ser corrigido "
+            f"antes de rodar a migração.\n"
+        )
+        return 1
+
+    print()
+    print("Próximos passos:")
+    print(f"  sudo ./run.sh --config {out_path} --dry-run --skip-install")
+    print(f"  sudo ./run.sh --config {out_path}   # migração real")
+    print()
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="plesk_migrator_orchestrator",
@@ -2342,8 +2624,19 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--config", required=True,
-        help="Caminho do YAML de configuração (ver config.example.yaml)",
+        "--config", required=False, default=None,
+        help="Caminho do YAML de configuração (ver config.example.yaml). "
+             "Não exigido em modo --init.",
+    )
+    parser.add_argument(
+        "--init", action="store_true",
+        help="Wizard interativo: pergunta valores e gera YAML chmod 600. "
+             "Saída em --config-out (default /etc/plesk-migration.yaml).",
+    )
+    parser.add_argument(
+        "--config-out", default=None,
+        help="Caminho de saída do YAML gerado pelo --init "
+             "(default /etc/plesk-migration.yaml).",
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="Loga comandos sem executá-los (apenas leitura roda)")
@@ -2445,6 +2738,16 @@ def _load_config(path: str) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.init:
+        return _run_init_wizard(args)
+
+    if not args.config:
+        sys.stderr.write(
+            "ERRO: --config é obrigatório (ou use --init para wizard "
+            "interativo).\n"
+        )
+        return 1
 
     try:
         config = _load_config(args.config)

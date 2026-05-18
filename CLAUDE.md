@@ -9,6 +9,7 @@ Orquestrador Python: cPanel → Plesk Obsidian.
 - Root no Plesk destino.
 
 ## Comandos
+- Wizard (gera YAML interativo, chmod 600, getpass na senha): `sudo ./run.sh --init` (ou `sudo ./run.sh` sem args dispara wizard se `/etc/plesk-migration.yaml` ausente). Override de path: `--config-out /tmp/teste.yaml`.
 - Dry-run: `sudo ./run.sh --config /etc/plesk-migration.yaml --dry-run --skip-install`
 - Real: `sudo ./run.sh --config /etc/plesk-migration.yaml --skip-install`
 - Retomar sessão: `sudo ./run.sh --config /etc/plesk-migration.yaml --skip-install --resume`

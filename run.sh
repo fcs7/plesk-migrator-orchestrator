@@ -33,4 +33,44 @@ if ! "$PYTHON_BIN" -c "import yaml" 2>/dev/null; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$PYTHON_BIN" "$SCRIPT_DIR/plesk_migrator_orchestrator.py" "$@"
+SCRIPT="$SCRIPT_DIR/plesk_migrator_orchestrator.py"
+
+# Auto-trigger wizard se ninguém passou --config, --init nem -h, e o
+# config padrão /etc/plesk-migration.yaml não existe.
+need_wizard=1
+for arg in "$@"; do
+  case "$arg" in
+    --config|--config=*|--init|-h|--help)
+      need_wizard=0
+      break ;;
+  esac
+done
+if [[ "$need_wizard" -eq 1 && ! -f /etc/plesk-migration.yaml ]]; then
+  if [[ -t 0 && -t 1 ]]; then
+    printf 'Nenhum config em /etc/plesk-migration.yaml.\n'
+    printf 'Iniciar wizard interativo? [Y/n] '
+    read -r ans
+    case "${ans:-y}" in
+      [Yy]*|[Ss]*)
+        # NÃO encaminha "$@" — args originais (--dry-run, --skip-install
+        # etc.) podem confundir o wizard. Depois do wizard, usuário roda
+        # comando real com flags desejadas.
+        "$PYTHON_BIN" "$SCRIPT" --init
+        rc=$?
+        if [[ $rc -ne 0 ]]; then exit "$rc"; fi
+        if [[ $# -gt 0 ]]; then
+          echo
+          echo "Wizard pronto. Rode agora seu comando original:"
+          echo "  sudo $0 $*"
+        fi
+        exit 0
+        ;;
+      *) echo "Abortado. Use --init ou --config <arquivo>." >&2; exit 1 ;;
+    esac
+  else
+    echo "ERRO: sem --config e sem TTY para wizard. Use --config <arquivo>." >&2
+    exit 1
+  fi
+fi
+
+exec "$PYTHON_BIN" "$SCRIPT" "$@"
