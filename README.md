@@ -30,6 +30,58 @@ sudo ./run.sh --config /etc/plesk-migration.yaml
 
 ---
 
+## Upgrading de uma versão anterior
+
+Se você tinha um YAML feito para uma versão anterior, algumas chaves agora são
+**rejeitadas na validação** (com mensagem de erro clara) ou foram **renomeadas**.
+Remova/ajuste antes de rodar a nova versão.
+
+### Chaves rejeitadas
+
+| Chave antiga | Por que foi rejeitada | O que fazer |
+|---|---|---|
+| `paths.conf_dir` | Auto-discovery resolve; override causa mismatch silencioso com `plesk-migrator` (que lê `config.ini` de path fixo). | Remover do YAML. |
+| `paths.sessions_dir` | Idem — `plesk-migrator` escreve sessões em path fixo. | Remover do YAML. |
+| `paths.session_name` | Idem — nome da sessão é fixo no migrator. | Remover do YAML. |
+| `migration.allowlist` (não-vazio) | Filtro local por linha corrompe `migration-list` estruturada (resellers/customers/plans/domains). | Remover ou esvaziar; ver [Filtragem de migration-list](#filtragem-de-migration-list) para alternativas. |
+| `migration.denylist` (não-vazio) | Idem. | Idem. |
+
+### Fase renomeada
+
+`--only-phase cleanup` virou `--only-phase cleanup-config` (reflete que a fase
+só apaga `config.ini`, não invoca um subcomando do `plesk-migrator`). A flag
+`--cleanup-config` (opt-in) **não** mudou.
+
+### Mensagem de erro que você verá
+
+```
+ERRO de configuração: paths.sessions_dir não pode ser sobrescrito — o orchestrator não propaga esse caminho para o plesk-migrator. Remova a chave do YAML (auto-discovery resolve o caminho real). Ver README seção 'Upgrading'.
+```
+
+### YAML antes / depois (trecho)
+
+```yaml
+# Antes (versão antiga)
+migration:
+  allowlist: ["site1.com"]
+  denylist:  ["teste.site.com"]
+paths:
+  sessions_dir: /usr/local/psa/var/modules/panel-migrator/sessions
+  session_name: migration-session
+```
+
+```yaml
+# Depois
+migration:
+  allowlist: []
+  denylist:  []
+paths:
+  # sessions_dir e session_name removidos — auto-discovery resolve.
+  log_dir: /var/log/plesk-migration-orchestrator
+```
+
+---
+
 ## Pré-requisitos
 
 - **Servidor Plesk Obsidian** rodando no destino (este host).
@@ -70,7 +122,16 @@ sudo ./run.sh --config /etc/plesk-migration.yaml --dry-run --skip-install
 ```
 
 Loga cada comando que seria executado e o conteúdo do `config.ini` que seria
-escrito (com senhas mascaradas como `***`). Não toca filesystem do Plesk.
+escrito (com senhas mascaradas como `***`). Em dry-run:
+
+- `config.ini` e `migration-list` **não** são escritos no disco.
+- `plesk-migrator check` (preflight) é **pulado** — depende de estado real
+  que dry-run não gera, então rodar contra estado obsoleto seria enganoso.
+- Apenas leituras inofensivas (`plesk extension --list`, `plesk-migrator help`)
+  rodam de verdade — usadas para auto-discovery e detecção da extensão.
+
+Para preflight real, rode `--only-phase preflight` (sem `--dry-run`) após
+o pipeline já ter gerado config + migration-list.
 
 ### Pipeline completo
 
@@ -81,6 +142,7 @@ sudo ./run.sh --config /etc/plesk-migration.yaml
 ### Fases isoladas
 
 ```bash
+sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase sanity-check
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase install
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase config
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase list
@@ -91,7 +153,7 @@ sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase copy-web
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase copy-mail
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase copy-db
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase test
-sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase cleanup --cleanup-config
+sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase cleanup-config --cleanup-config
 ```
 
 ### Outras flags
@@ -114,17 +176,18 @@ Flags CLI sempre sobrescrevem o bloco `behavior.*` do YAML.
 
 | # | Fase | O que faz |
 |---|------|-----------|
-| 1 | `install` | Detecta `panel-migrator` via `extension --list`; se ausente, instala via `plesk installer --select-release-current --install-component panel-migrator` |
-| 2 | `config` | Gera `config.ini` em `conf_dir/` com seções `[GLOBAL]`/`[plesk]`/`[cpanel]` (chmod 600) |
-| 3 | `list` | Roda `generate-migration-list`; aborta se já existe (use `--force-regenerate`) |
-| 4 | `filter` | Aplica allowlist/denylist em `migration-list` (cria `.bak`); pula se ambas vazias |
-| 5 | `preflight` | Roda `plesk-migrator check` (valida SSH, espaço, versão da origem etc.). Roda após `filter` porque o check deve refletir a migration-list final |
-| 6 | `transfer` | Roda `transfer-accounts` (com flags `--skip-copy-*-content` opcionais) |
-| 7 | `copy-web` | Roda `copy-web-content` para re-sincronizar arquivos web |
-| 8 | `copy-mail` | Roda `copy-mail-content` para re-sincronizar mailboxes |
-| 9 | `copy-db` | Roda `copy-db-content` para re-sincronizar bancos |
-| 10 | `test` | Roda `test-all` para validar o resultado |
-| 11 | `cleanup` | Apaga `config.ini` se `--cleanup-config` (default: pula) |
+| 1 | `sanity-check` | Auto-diagnóstico do ambiente: confirma root, `plesk` binary localizado, e `plesk version` retorna Obsidian 18.x+. Aborta cedo se não bate. Pulado em `--dry-run`. |
+| 2 | `install` | Detecta `panel-migrator` via `extension --list`; se ausente, instala via `plesk installer --select-release-current --install-component panel-migrator`. Após install, valida com `plesk-migrator help`. |
+| 3 | `config` | Gera `config.ini` em `conf_dir/` com seções `[GLOBAL]`/`[plesk]`/`[cpanel]` (chmod 600) |
+| 4 | `list` | Roda `generate-migration-list`; aborta se já existe (use `--force-regenerate`); aborta se a lista sair vazia |
+| 5 | `filter` | **Desabilitada** nesta versão (no-op). Ver [Filtragem de migration-list](#filtragem-de-migration-list) |
+| 6 | `preflight` | Roda `plesk-migrator check` (valida SSH, espaço, versão da origem etc.). Pulado em `--dry-run` |
+| 7 | `transfer` | Roda `transfer-accounts` (com flags `--skip-copy-*-content` opcionais) |
+| 8 | `copy-web` | Roda `copy-web-content` para re-sincronizar arquivos web |
+| 9 | `copy-mail` | Roda `copy-mail-content` para re-sincronizar mailboxes |
+| 10 | `copy-db` | Roda `copy-db-content` para re-sincronizar bancos |
+| 11 | `test` | Roda `test-all` para validar o resultado |
+| 12 | `cleanup-config` | Apaga `config.ini` se `--cleanup-config` (default: pula). **NÃO** invoca subcomando do `plesk-migrator` — só remove a senha do disco |
 
 Cada fase tem timeout configurado (10 min para install, 4 h para transfer e
 cada `copy-*`, 1 h para `generate-list`, 30 min para `check`, 2 h para `test`).
@@ -158,12 +221,48 @@ tail -f /var/log/plesk-migration-orchestrator/transfer-accounts.log
 tail -f /var/log/plesk-migration-orchestrator/copy-web.log
 ```
 
-### Restaurar migration-list filtrada
+### Filtragem de migration-list
 
-```bash
-mv /usr/local/psa/var/modules/panel-migrator/sessions/migration-session/migration-list.bak \
-   /usr/local/psa/var/modules/panel-migrator/sessions/migration-session/migration-list
+Filtragem local via `migration.allowlist` / `migration.denylist` está
+**desabilitada** nesta versão. O arquivo `migration-list` gerado pelo Plesk
+Migrator contém objetos estruturados (resellers, customers, plans, domínios)
+e um filtro ingênuo por linha corrompe a hierarquia. Se `allowlist` ou
+`denylist` no YAML não estiverem vazios, a validação aborta antes do
+pipeline rodar.
+
+Alternativas para limitar escopo:
+
+1. **Edição manual** entre fases:
+   ```bash
+   sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase list
+   sudo $EDITOR /usr/local/psa/var/modules/panel-migrator/sessions/migration-session/migration-list
+   sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase preflight
+   sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase transfer
+   # … etc
+   ```
+2. **Flag nativa** `--migration-list-file <path>` do `plesk-migrator`
+   (não exposta ainda — ver `# EXTEND:` no código).
+
+### Auto-discovery de caminhos
+
+O orquestrador procura os binários do Plesk em locais canônicos antes de
+qualquer fase: `/usr/local/psa/bin/`, `/opt/psa/bin/`, `/usr/sbin/` e
+`$PATH`. O log no início mostra exatamente o que foi resolvido:
+
 ```
+[INFO] Auto-discovery de caminhos:
+[INFO]   plesk:           /usr/local/psa/bin/plesk
+[INFO]   extension:       /usr/local/psa/bin/extension
+[INFO]   plesk-migrator:  /usr/local/psa/admin/sbin/modules/panel-migrator/plesk-migrator
+[INFO]   conf_dir:        /usr/local/psa/var/modules/panel-migrator/conf
+[INFO]   sessions_dir:    /usr/local/psa/var/modules/panel-migrator/sessions
+```
+
+Se algum aparecer como `(não encontrado)`, edite o YAML para apontar
+manualmente (`paths.plesk_bin`, `paths.plesk_extension_bin`,
+`paths.plesk_migrator_bin`). `conf_dir`, `sessions_dir` e `session_name`
+**não** podem ser sobrescritos — o `plesk-migrator` lê/escreve nesses
+paths fixos e qualquer override criaria mismatch silencioso.
 
 ### Flags avançadas do Plesk Migrator
 
@@ -204,6 +303,11 @@ término ou via signal handler (SIGINT/SIGTERM).
   ```bash
   sudo chmod 600 /etc/plesk-migration.yaml
   ```
+- **Quem edita o YAML controla execução com root**: além da `ssh_password` em
+  texto plano, as chaves `paths.plesk_bin`, `paths.plesk_extension_bin` e
+  `paths.plesk_migrator_bin` viram `argv[0]` em chamadas `subprocess.Popen`
+  rodando como root. Não confie em YAML de origem não controlada — `chmod 600`
+  no arquivo é **essencial, não opcional**.
 - Todos os logs aplicam mascaramento automático de `ssh_password` e
   `postgres_password` (substitui pelo literal `***` em stdout, stderr e
   arquivos por fase).

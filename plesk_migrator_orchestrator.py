@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 
 try:
@@ -46,8 +47,28 @@ DEFAULT_CONF_DIR = "/usr/local/psa/var/modules/panel-migrator/conf"
 DEFAULT_SESSIONS_DIR = "/usr/local/psa/var/modules/panel-migrator/sessions"
 DEFAULT_SESSION_NAME = "migration-session"
 DEFAULT_LOG_DIR = "/var/log/plesk-migration-orchestrator"
-PLESK_EXTENSION_BIN = "/usr/local/psa/bin/extension"
 LOCK_FILE = "/var/lock/plesk-migration-orchestrator.lock"
+
+# Locais conhecidos para auto-discovery (ordem importa: primeiro hit ganha).
+# Plesk usa caminhos canônicos, mas alguns hosters/builds movem binários — o
+# auto-discovery reduz erros silenciosos por caminho errado.
+_PLESK_BIN_CANDIDATES = [
+    "/usr/local/psa/bin/plesk",
+    "/usr/sbin/plesk",
+    "/opt/psa/bin/plesk",
+]
+_EXTENSION_BIN_CANDIDATES = [
+    "/usr/local/psa/bin/extension",
+    "/opt/psa/bin/extension",
+]
+_PANEL_MIGRATOR_MODULE_CANDIDATES = [
+    "/usr/local/psa/var/modules/panel-migrator",
+    "/opt/psa/var/modules/panel-migrator",
+]
+_PLESK_MIGRATOR_BIN_CANDIDATES = [
+    "/usr/local/psa/admin/sbin/modules/panel-migrator/plesk-migrator",
+    "/opt/psa/admin/sbin/modules/panel-migrator/plesk-migrator",
+]
 
 # Timeouts por fase (segundos)
 TIMEOUT_INSTALL = 600          # 10 min
@@ -63,15 +84,18 @@ SENSITIVE_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Comandos imutáveis que podem rodar mesmo em --dry-run (apenas leitura)
+# Comandos imutáveis que podem rodar mesmo em --dry-run (apenas leitura).
+# NB: `plesk-migrator check` NÃO está aqui — apesar de ler, ele depende de
+# `config.ini` e da `migration-list`, que dry-run não escreve/gera. Rodar em
+# dry-run lê estado obsoleto ou falha — preflight é pulado em dry-run.
 _READ_ONLY_COMMANDS = (
     ("extension", "--list"),
     ("extension", "--info"),
     ("plesk-migrator", "help"),
-    ("plesk-migrator", "check"),
 )
 
 PHASES_ORDER = [
+    "sanity-check",
     "install",
     "config",
     "list",
@@ -82,7 +106,7 @@ PHASES_ORDER = [
     "copy-mail",
     "copy-db",
     "test",
-    "cleanup",
+    "cleanup-config",
 ]
 
 
@@ -135,14 +159,6 @@ class PleskMigrationOrchestrator:
         self._validate_config()
 
         paths = self.config.get("paths") or {}
-        self.plesk_migrator_bin = pathlib.Path(
-            paths.get("plesk_migrator_bin") or DEFAULT_PLESK_MIGRATOR_BIN
-        )
-        self.conf_dir = pathlib.Path(paths.get("conf_dir") or DEFAULT_CONF_DIR)
-        self.sessions_dir = pathlib.Path(
-            paths.get("sessions_dir") or DEFAULT_SESSIONS_DIR
-        )
-        self.session_name = paths.get("session_name") or DEFAULT_SESSION_NAME
         self.log_dir = pathlib.Path(paths.get("log_dir") or DEFAULT_LOG_DIR)
 
         # Valores sensíveis para mascaramento literal
@@ -154,6 +170,12 @@ class PleskMigrationOrchestrator:
             self.sensitive_values.append(str(src["postgres_password"]))
 
         self.logger = self._setup_logger()
+
+        # Auto-discovery dos caminhos do Plesk no servidor. Atributos definidos:
+        # plesk_bin, plesk_extension_bin, plesk_migrator_bin, conf_dir,
+        # sessions_dir, session_name. Re-roda após install para detectar
+        # plesk-migrator recém-instalado.
+        self._discover_paths()
 
         self._lock_fd: int | None = None
         self._current_proc: subprocess.Popen | None = None
@@ -212,10 +234,44 @@ class PleskMigrationOrchestrator:
                 raise ValidationError(
                     f"migration.{key} deve conter apenas strings"
                 )
-        cfg["migration"] = {
-            "allowlist": migration.get("allowlist", []),
-            "denylist": migration.get("denylist", []),
-        }
+            if val:
+                # `migration-list` contém objetos estruturados (resellers,
+                # customers, plans, domínios) e o filtro por "primeiro token"
+                # corrompe entradas não-domínio. Bloqueia até termos parser
+                # do formato oficial. Alternativas: editar migration-list
+                # manualmente (--only-phase list, edita, --only-phase
+                # preflight em diante) ou usar `--migration-list-file` do
+                # plesk-migrator nativo.
+                raise ValidationError(
+                    f"migration.{key} não é suportado nesta versão — o filtro "
+                    "local pode corromper migration-list. Edite a lista "
+                    "manualmente ou use plesk-migrator --migration-list-file. "
+                    "Ver README seções 'Upgrading' e 'Filtragem de "
+                    "migration-list'."
+                )
+        cfg["migration"] = {"allowlist": [], "denylist": []}
+
+        paths = cfg.get("paths") or {}
+        # Overrides que o orchestrator NÃO consegue propagar para plesk-migrator
+        # (que lê config.ini de path fixo e gerencia sessões em path fixo).
+        # Aceitar override aqui criaria mismatch silencioso: o orchestrator
+        # olharia num lugar e o plesk-migrator escreveria em outro.
+        for locked in ("conf_dir", "sessions_dir", "session_name"):
+            if paths.get(locked):
+                raise ValidationError(
+                    f"paths.{locked} não pode ser sobrescrito — o orchestrator "
+                    "não propaga esse caminho para o plesk-migrator. Remova a "
+                    "chave do YAML (auto-discovery resolve o caminho real). "
+                    "Ver README seção 'Upgrading'."
+                )
+        for path_key in (
+            "plesk_migrator_bin", "plesk_bin", "plesk_extension_bin", "log_dir",
+        ):
+            if path_key in paths and paths[path_key] is not None:
+                if not isinstance(paths[path_key], str):
+                    raise ValidationError(
+                        f"paths.{path_key} deve ser string ou null"
+                    )
 
         behavior = cfg.get("behavior") or {}
         skip = behavior.get("skip") or {}
@@ -226,6 +282,119 @@ class PleskMigrationOrchestrator:
                     "cleanup_config"):
             if key in behavior and not isinstance(behavior[key], bool):
                 raise ValidationError(f"behavior.{key} deve ser bool")
+
+    # ------------------------------------------------------------------
+    # Auto-discovery de caminhos
+    # ------------------------------------------------------------------
+
+    def _resolve_binary(
+        self,
+        override: str | None,
+        candidates: list[str],
+        *,
+        label: str,
+        optional: bool = False,
+    ) -> pathlib.Path | None:
+        """Resolve um binário: override YAML > candidatos fixos > $PATH.
+
+        Override é validado de forma rigorosa: se o arquivo não existe ou não
+        é executável, raise ValidationError (em vez de devolver path inválido
+        e deixar FileNotFoundError vazar mais tarde com traceback feio).
+        Auto-discovery sem override permanece leniente conforme `optional`.
+        """
+        if override:
+            p = pathlib.Path(override)
+            if not p.is_file():
+                raise ValidationError(
+                    f"paths.{label} aponta para {override} mas o arquivo "
+                    "não existe (ou não é arquivo regular)."
+                )
+            if not os.access(p, os.X_OK):
+                raise ValidationError(
+                    f"paths.{label} aponta para {override} mas não é "
+                    "executável (chmod +x?)."
+                )
+            return p
+        for cand in candidates:
+            cp = pathlib.Path(cand)
+            if cp.exists():
+                return cp
+        # Última tentativa: $PATH com o basename do primeiro candidato.
+        if candidates:
+            found = shutil.which(pathlib.Path(candidates[0]).name)
+            if found:
+                return pathlib.Path(found)
+        if not optional:
+            self.logger.warning(
+                "Não localizei binário %s em locais conhecidos nem no $PATH",
+                label,
+            )
+        return None
+
+    def _resolve_module_dir(self) -> pathlib.Path | None:
+        """Procura o diretório do módulo panel-migrator (anchor para conf/sessions)."""
+        for cand in _PANEL_MIGRATOR_MODULE_CANDIDATES:
+            cp = pathlib.Path(cand)
+            if cp.is_dir():
+                return cp
+        return None
+
+    def _discover_paths(self) -> None:
+        """Probing do filesystem para resolver caminhos reais do Plesk.
+
+        Honra overrides do YAML quando presentes; senão procura nos locais
+        canônicos. Re-executável: o install phase chama de novo para detectar
+        plesk-migrator recém-instalado.
+        """
+        paths_cfg = self.config.get("paths") or {}
+
+        self.plesk_bin = self._resolve_binary(
+            paths_cfg.get("plesk_bin"),
+            _PLESK_BIN_CANDIDATES,
+            label="plesk_bin",
+            optional=True,
+        )
+        self.plesk_extension_bin = self._resolve_binary(
+            paths_cfg.get("plesk_extension_bin"),
+            _EXTENSION_BIN_CANDIDATES,
+            label="plesk_extension_bin",
+            optional=True,
+        )
+        self.plesk_migrator_bin = self._resolve_binary(
+            paths_cfg.get("plesk_migrator_bin"),
+            _PLESK_MIGRATOR_BIN_CANDIDATES,
+            label="plesk_migrator_bin",
+            optional=True,  # pode não existir antes do install
+        )
+
+        module_dir = self._resolve_module_dir()
+        if module_dir:
+            self.conf_dir = module_dir / "conf"
+            self.sessions_dir = module_dir / "sessions"
+        else:
+            # Fallback para defaults canônicos; o install phase cria a árvore.
+            self.conf_dir = pathlib.Path(DEFAULT_CONF_DIR)
+            self.sessions_dir = pathlib.Path(DEFAULT_SESSIONS_DIR)
+        self.session_name = DEFAULT_SESSION_NAME
+
+        self.logger.info("Auto-discovery de caminhos:")
+        self.logger.info(
+            "  plesk:           %s",
+            self.plesk_bin or "(não encontrado — necessário para install)",
+        )
+        self.logger.info(
+            "  extension:       %s",
+            self.plesk_extension_bin
+            or "(não encontrado — necessário para detectar panel-migrator)",
+        )
+        self.logger.info(
+            "  plesk-migrator:  %s",
+            self.plesk_migrator_bin
+            or "(não instalado — será resolvido após fase install)",
+        )
+        self.logger.info("  conf_dir:        %s", self.conf_dir)
+        self.logger.info("  sessions_dir:    %s", self.sessions_dir)
+        self.logger.info("  session_name:    %s", self.session_name)
 
     # ------------------------------------------------------------------
     # Logging + mascaramento
@@ -361,13 +530,20 @@ class PleskMigrationOrchestrator:
             timer: threading.Timer | None = None
             if timeout is not None and timeout > 0:
                 def _on_timeout() -> None:
+                    # SIGTERM + grace antes de SIGKILL — fases longas (transfer,
+                    # copy-*) podem ter rsync/SSH ativos na origem; matar direto
+                    # deixa locks e conexões zumbis na sessão do Plesk Migrator.
                     timeout_fired.set()
                     self.logger.error(
-                        "Timeout (%ss) excedido. Encerrando subprocess…",
+                        "Timeout (%ss) excedido. SIGTERM → wait 15s → SIGKILL.",
                         timeout,
                     )
                     try:
-                        proc.kill()
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=15)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
                     except ProcessLookupError:
                         pass
                 timer = threading.Timer(timeout, _on_timeout)
@@ -438,6 +614,7 @@ class PleskMigrationOrchestrator:
         self.logger.debug("Lock adquirido em %s", LOCK_FILE)
 
     def _release_lock(self) -> None:
+        # async-signal-safe: nada de self.logger aqui (ver _cleanup_subprocess).
         if self._lock_fd is not None:
             try:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
@@ -448,16 +625,24 @@ class PleskMigrationOrchestrator:
             except OSError:
                 pass
             self._lock_fd = None
-            self.logger.debug("Lock liberado")
 
     def _install_signal_handlers(self) -> None:
         signal.signal(signal.SIGINT, self._cleanup_subprocess)
         signal.signal(signal.SIGTERM, self._cleanup_subprocess)
 
     def _cleanup_subprocess(self, signum=None, frame=None) -> None:
-        self.logger.warning(
-            "Sinal %s recebido. Encerrando subprocess…", signum
-        )
+        # NÃO usar self.logger aqui: o módulo logging usa lock interno e
+        # signals podem interromper outra thread que já está logando — re-entrar
+        # no mesmo lock causa deadlock. Usamos os.write para o stderr direto,
+        # que é async-signal-safe.
+        try:
+            os.write(
+                2,
+                f"\n[SIGNAL] Sinal {signum} recebido — encerrando subprocess…\n"
+                .encode("utf-8"),
+            )
+        except OSError:
+            pass
         proc = self._current_proc
         if proc is not None and proc.poll() is None:
             proc.terminate()
@@ -472,13 +657,147 @@ class PleskMigrationOrchestrator:
     # Fases (§7 spec)
     # ------------------------------------------------------------------
 
+    def sanity_check(self) -> None:
+        """Auto-diagnóstico do ambiente antes de qualquer fase mutativa.
+
+        Roda como primeira fase do pipeline. Confirma que estamos num host
+        Plesk Obsidian operacional rodando como root. Aborta com mensagem
+        clara em vez de deixar o pipeline falhar fragmentado mais adiante.
+
+        Em dry-run: skip (`plesk version` exige binário real).
+        """
+        self.logger.info("Fase: sanity_check")
+        if self.dry_run:
+            self.logger.info(
+                "[DRY-RUN] sanity-check pulado — `plesk version` precisa "
+                "do binário real."
+            )
+            return
+
+        # 1. Privilégio: orchestrator escreve em /usr/local/psa/var/... e
+        # invoca `plesk installer` — exige root.
+        euid = os.geteuid() if hasattr(os, "geteuid") else -1
+        if euid != 0:
+            raise PreflightError(
+                f"Orchestrator precisa rodar como root (uid 0), atual={euid}. "
+                "Use `sudo ./run.sh --config /etc/plesk-migration.yaml`."
+            )
+
+        # 2. Auto-discovery resolveu o binário plesk?
+        if not self.plesk_bin:
+            raise PreflightError(
+                "Binário 'plesk' não localizado em locais conhecidos nem no "
+                f"$PATH. Procurei em: {', '.join(_PLESK_BIN_CANDIDATES)}. "
+                "Este host não parece ser um servidor Plesk Obsidian. "
+                "Sobrescreva paths.plesk_bin no YAML se o caminho for outro."
+            )
+
+        # 3. Plesk operacional e versão Obsidian (>= 18.x). `plesk version`
+        # imprime info do produto; aceitamos "obsidian" no output OU major
+        # version >= 18 (tolerante a variações de formatação).
+        result = self._run([str(self.plesk_bin), "version"], check=False)
+        if result.returncode != 0:
+            raise PreflightError(
+                f"`plesk version` retornou rc={result.returncode} — Plesk "
+                "não está respondendo. Verifique se o serviço está rodando."
+            )
+        output = result.stdout or ""
+        version_ok = "obsidian" in output.lower()
+        if not version_ok:
+            match = re.search(r"(\d+)\.\d+", output)
+            if match and int(match.group(1)) >= 18:
+                version_ok = True
+        if not version_ok:
+            raise PreflightError(
+                "Versão do Plesk não identificada como Obsidian (>= 18.x). "
+                f"Saída de `plesk version`:\n{output[:500]}"
+            )
+
+        self.logger.info(
+            "✓ sanity-check OK: rodando como root, plesk em %s, Obsidian 18.x+",
+            self.plesk_bin,
+        )
+
+    def _require_runtime_state(self) -> None:
+        """Aborta se config.ini/migration-list faltam (pré-req de fases pós-list).
+
+        Sem isso, `--only-phase transfer` (ou copy-*, test, preflight) num
+        diretório limpo deixaria o plesk-migrator falhar com erro críptico
+        em vez do orchestrator avisar qual fase rodar antes.
+
+        Skip em dry-run (estado real não é gerado nesse modo).
+        """
+        if self.dry_run:
+            return
+        config_path = self.conf_dir / "config.ini"
+        migration_list = self.sessions_dir / self.session_name / "migration-list"
+        missing: list[str] = []
+        if not config_path.exists():
+            missing.append(
+                f"config.ini não existe em {config_path} — rode "
+                "--only-phase config primeiro"
+            )
+        if not migration_list.exists():
+            missing.append(
+                f"migration-list não existe em {migration_list} — rode "
+                "--only-phase list primeiro"
+            )
+        if missing:
+            raise PhaseExecutionError("; ".join(missing))
+
+    def _require_plesk_migrator_bin(self) -> None:
+        """Garante plesk-migrator localizado; em dry-run usa placeholder canônico."""
+        if self.plesk_migrator_bin:
+            return
+        if self.dry_run:
+            # Em dry-run o binário não é executado; usar o default permite
+            # logar o comando que SERIA invocado. O fallback de
+            # FileNotFoundError em _run cobre o caso do path não existir.
+            self.plesk_migrator_bin = pathlib.Path(DEFAULT_PLESK_MIGRATOR_BIN)
+            self.logger.info(
+                "[DRY-RUN] plesk-migrator não localizado; usando placeholder "
+                "%s para log de comandos.",
+                self.plesk_migrator_bin,
+            )
+            return
+        raise PhaseExecutionError(
+            "plesk-migrator não localizado no servidor. Rode a fase "
+            "'install' antes (sem --skip-install) ou aponte "
+            "paths.plesk_migrator_bin no YAML."
+        )
+
     def ensure_plesk_migrator_installed(self) -> None:
         self.logger.info("Fase: ensure_plesk_migrator_installed")
+        if not self.plesk_extension_bin:
+            if self.dry_run:
+                self.logger.info(
+                    "[DRY-RUN] binário 'extension' não localizado; assumindo "
+                    "panel-migrator ausente e simulando install."
+                )
+                self.plesk_extension_bin = pathlib.Path(
+                    _EXTENSION_BIN_CANDIDATES[0]
+                )
+            else:
+                raise PreflightError(
+                    "Binário 'extension' do Plesk não localizado — este host "
+                    "não parece ser um servidor Plesk Obsidian. Veja log de "
+                    "auto-discovery."
+                )
+        if not self.plesk_bin:
+            if self.dry_run:
+                self.plesk_bin = pathlib.Path(_PLESK_BIN_CANDIDATES[0])
+            else:
+                raise PreflightError(
+                    "Binário 'plesk' não localizado — necessário para "
+                    "invocar 'plesk installer'."
+                )
+
         result = self._run(
-            [PLESK_EXTENSION_BIN, "--list"], check=False
+            [str(self.plesk_extension_bin), "--list"], check=False
         )
         if "panel-migrator" in (result.stdout or "").lower():
             self.logger.info("panel-migrator já instalado.")
+            self._discover_paths()
             return
 
         self.logger.info(
@@ -486,7 +805,7 @@ class PleskMigrationOrchestrator:
         )
         self._run(
             [
-                "plesk", "installer",
+                str(self.plesk_bin), "installer",
                 "--select-release-current",
                 "--install-component", "panel-migrator",
             ],
@@ -499,7 +818,7 @@ class PleskMigrationOrchestrator:
             return
 
         check = self._run(
-            [PLESK_EXTENSION_BIN, "--list"], check=False
+            [str(self.plesk_extension_bin), "--list"], check=False
         )
         if "panel-migrator" not in (check.stdout or "").lower():
             raise PreflightError(
@@ -507,31 +826,58 @@ class PleskMigrationOrchestrator:
                 "em 'extension --list'."
             )
 
+        # Re-discovery: agora plesk-migrator e diretório do módulo existem.
+        self._discover_paths()
+        if not self.plesk_migrator_bin:
+            raise PreflightError(
+                "Install reportou OK mas binário plesk-migrator não foi "
+                "localizado após auto-discovery. Verifique o log de install."
+            )
+
+        # Sanity pós-install: `plesk-migrator help` deve responder OK,
+        # confirmando que o binário não está corrompido ou faltando libs.
+        help_result = self._run(
+            [str(self.plesk_migrator_bin), "help"], check=False
+        )
+        if help_result.returncode != 0:
+            raise PreflightError(
+                f"plesk-migrator help retornou rc={help_result.returncode} "
+                "após install — install pode estar corrompido. Recomendado "
+                "reinstalar via `plesk installer --reinstall-patch "
+                "--install-component panel-migrator`."
+            )
+        self.logger.info("✓ plesk-migrator operacional (help rc=0)")
+
     def generate_config_ini(self) -> pathlib.Path:
         self.logger.info("Fase: generate_config_ini")
         src = self.config["source"]
         dst = self.config["dest"]
 
+        # `source-servers` em [GLOBAL] aponta para o NOME da seção que descreve
+        # cada servidor de origem (docs Plesk). Mantemos o link explícito numa
+        # variável para que renomear a seção não exija atualizar dois lugares.
+        SOURCE_SECTION = "cpanel"
+
         cfg = configparser.ConfigParser()
         cfg["GLOBAL"] = {
             "source-type": "cpanel",
-            "source-servers": "cpanel",
+            "source-servers": SOURCE_SECTION,
             "target-type": "plesk",
         }
         cfg["plesk"] = {
             "ip": dst["host"],
             "os": "unix",
         }
-        cpanel_section = {
+        source_server = {
             "ip": src["host"],
             "os": "unix",
             "ssh-password": src["ssh_password"],
         }
         if int(src.get("ssh_port", 22)) != 22:
-            cpanel_section["ssh-port"] = str(src["ssh_port"])
+            source_server["ssh-port"] = str(src["ssh_port"])
         if src.get("postgres_password"):
-            cpanel_section["postgres-password"] = src["postgres_password"]
-        cfg["cpanel"] = cpanel_section
+            source_server["postgres-password"] = src["postgres_password"]
+        cfg[SOURCE_SECTION] = source_server
 
         config_path = self.conf_dir / "config.ini"
 
@@ -578,6 +924,14 @@ class PleskMigrationOrchestrator:
 
     def preflight_checks(self) -> None:
         self.logger.info("Fase: preflight_checks")
+        if self.dry_run:
+            self.logger.info(
+                "[DRY-RUN] plesk-migrator check pulado — depende de config.ini "
+                "e migration-list reais (não escritos em dry-run)."
+            )
+            return
+        self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         try:
             self._run(
                 [str(self.plesk_migrator_bin), "check"],
@@ -592,6 +946,7 @@ class PleskMigrationOrchestrator:
 
     def generate_migration_list(self) -> pathlib.Path:
         self.logger.info("Fase: generate_migration_list")
+        self._require_plesk_migrator_bin()
         session_dir = self.sessions_dir / self.session_name
         migration_list = session_dir / "migration-list"
 
@@ -621,9 +976,14 @@ class PleskMigrationOrchestrator:
                 "após generate-migration-list."
             )
 
-        line_count = sum(
-            1 for _ in migration_list.open("r", encoding="utf-8", errors="replace")
-        )
+        with migration_list.open("r", encoding="utf-8", errors="replace") as fh:
+            line_count = sum(1 for _ in fh)
+        if line_count == 0:
+            raise PhaseExecutionError(
+                f"migration-list em {migration_list} foi gerada vazia. "
+                "Verifique conexão SSH, credenciais e se há contas válidas "
+                "na origem."
+            )
         self.logger.info(
             "migration-list gerada (%d linhas) em %s",
             line_count, migration_list,
@@ -635,83 +995,12 @@ class PleskMigrationOrchestrator:
         allowlist: list[str] | None = None,
         denylist: list[str] | None = None,
     ) -> None:
-        self.logger.info("Fase: filter_migration_list")
-        migration_cfg = self.config.get("migration") or {}
-        allowlist = (
-            allowlist if allowlist is not None
-            else migration_cfg.get("allowlist", [])
-        )
-        denylist = (
-            denylist if denylist is not None
-            else migration_cfg.get("denylist", [])
-        )
-
-        if not allowlist and not denylist:
-            self.logger.info("Sem allowlist/denylist — nada a filtrar.")
-            return
-
-        allowset = {d.lower() for d in allowlist}
-        denyset = {d.lower() for d in denylist}
-
-        migration_list = (
-            self.sessions_dir / self.session_name / "migration-list"
-        )
-
-        if self.dry_run:
-            self.logger.info(
-                "[DRY-RUN] aplicaria filtros (allow=%s, deny=%s) em %s",
-                sorted(allowset), sorted(denyset), migration_list,
-            )
-            return
-
-        if not migration_list.exists():
-            raise PhaseExecutionError(
-                f"migration-list não existe em {migration_list}. "
-                "Rode a fase 'list' antes."
-            )
-
-        backup_path = migration_list.with_suffix(".bak")
-        shutil.copy2(migration_list, backup_path)
-        self.logger.info("Backup em %s", backup_path)
-
-        kept_lines: list[str] = []
-        removed: list[str] = []
-        initial = 0
-        kept_domains = 0
-        with migration_list.open("r", encoding="utf-8", errors="replace") as fh:
-            for raw in fh:
-                line = raw.rstrip("\n")
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    kept_lines.append(line)
-                    continue
-                initial += 1
-                domain = stripped.split()[0].lower()
-                keep = (not allowset or domain in allowset) and (
-                    domain not in denyset
-                )
-                if keep:
-                    kept_lines.append(line)
-                    kept_domains += 1
-                else:
-                    removed.append(domain)
-
-        if initial > 0 and kept_domains == 0:
-            shutil.copy2(backup_path, migration_list)
-            raise PhaseExecutionError(
-                "Filtro removeria todos os domínios. Migration-list "
-                f"restaurado do backup ({backup_path}). Revise allow/denylist."
-            )
-
-        with migration_list.open("w", encoding="utf-8") as fh:
-            fh.write("\n".join(kept_lines))
-            if kept_lines:
-                fh.write("\n")
-
-        sample = ", ".join(removed[:5]) + (" …" if len(removed) > 5 else "")
+        # Filtro local foi desabilitado: ver _validate_config. A validação
+        # já garante allowlist/denylist vazios; este método existe apenas
+        # para manter a fase no pipeline (no-op informativo).
         self.logger.info(
-            "%d/%d domínios mantidos. Removidos (%d): %s",
-            kept_domains, initial, len(removed), sample or "—",
+            "Fase: filter_migration_list — desabilitada (filtro local pode "
+            "corromper migration-list estruturada). No-op."
         )
 
     def transfer_accounts(
@@ -722,6 +1011,8 @@ class PleskMigrationOrchestrator:
         skip_db: bool = False,
     ) -> None:
         self.logger.info("Fase: transfer_accounts")
+        self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         cmd = [str(self.plesk_migrator_bin), "transfer-accounts"]
         if skip_web:
             cmd.append("--skip-copy-web-content")
@@ -740,6 +1031,8 @@ class PleskMigrationOrchestrator:
 
     def copy_web_content(self) -> None:
         self.logger.info("Fase: copy_web_content")
+        self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         self._run(
             [str(self.plesk_migrator_bin), "copy-web-content"],
             timeout=TIMEOUT_COPY_CONTENT,
@@ -748,6 +1041,8 @@ class PleskMigrationOrchestrator:
 
     def copy_mail_content(self) -> None:
         self.logger.info("Fase: copy_mail_content")
+        self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         self._run(
             [str(self.plesk_migrator_bin), "copy-mail-content"],
             timeout=TIMEOUT_COPY_CONTENT,
@@ -756,6 +1051,8 @@ class PleskMigrationOrchestrator:
 
     def copy_db_content(self) -> None:
         self.logger.info("Fase: copy_db_content")
+        self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         self._run(
             [str(self.plesk_migrator_bin), "copy-db-content"],
             timeout=TIMEOUT_COPY_CONTENT,
@@ -764,6 +1061,8 @@ class PleskMigrationOrchestrator:
 
     def test_all(self) -> None:
         self.logger.info("Fase: test_all")
+        self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         self._run(
             [str(self.plesk_migrator_bin), "test-all"],
             timeout=TIMEOUT_TEST_ALL,
@@ -819,10 +1118,12 @@ class PleskMigrationOrchestrator:
             migration_cfg.get("allowlist") or migration_cfg.get("denylist")
         )
 
-        # Ordem: preflight roda DEPOIS de list/filter porque
-        # `plesk-migrator check` valida a migration-list atual e deve ser
-        # re-executado sempre que ela mudar (docs Plesk CLI guide).
-        phases: list[tuple[str, callable, bool]] = [
+        # Ordem: sanity-check primeiro (aborta cedo se não-Plesk ou não-root);
+        # preflight roda DEPOIS de list/filter porque `plesk-migrator check`
+        # valida a migration-list atual e deve ser re-executado sempre que
+        # ela mudar (docs Plesk CLI guide).
+        phases: list[tuple[str, Callable[[], None], bool]] = [
+            ("sanity-check", self.sanity_check, True),
             ("install", self.ensure_plesk_migrator_installed, not skip_install),
             ("config", self.generate_config_ini, True),
             ("list", self.generate_migration_list, True),
@@ -844,7 +1145,7 @@ class PleskMigrationOrchestrator:
             ("copy-mail", self.copy_mail_content, not skip_mail_content),
             ("copy-db", self.copy_db_content, not skip_db_content),
             ("test", self.test_all, True),
-            ("cleanup", self.cleanup_config_ini, self.cleanup_config),
+            ("cleanup-config", self.cleanup_config_ini, self.cleanup_config),
         ]
 
         self._acquire_lock()

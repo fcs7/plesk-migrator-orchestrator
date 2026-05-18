@@ -17,20 +17,35 @@ dest:
   host: 192.0.2.20              # IP/hostname do servidor Plesk Obsidian
 
 # -----------------------------------------------------------------------------
-# Filtros de migração (vazio = migra tudo da migration-list)
+# Filtros de migração (DESABILITADO nesta versão)
 # -----------------------------------------------------------------------------
+# Filtragem local de migration-list está desabilitada: o arquivo gerado por
+# `plesk-migrator generate-migration-list` contém objetos estruturados
+# (resellers, customers, plans, domínios) e um filtro por linha pode corromper
+# a hierarquia. Para limitar escopo:
+#   1) Rode --only-phase list, edite manualmente a migration-list, depois
+#      continue com --only-phase preflight em diante; OU
+#   2) Use a flag nativa --migration-list-file do plesk-migrator.
+# As chaves abaixo continuam validadas (apenas para alertar): listas
+# não-vazias provocam ValidationError antes do pipeline rodar.
 migration:
-  allowlist: []                 # ex: ["site1.com", "site2.com"] — só migra esses
-  denylist:  []                 # ex: ["teste.site.com"] — exclui esses
+  allowlist: []
+  denylist:  []
 
 # -----------------------------------------------------------------------------
-# Paths (null = usa defaults oficiais do Plesk)
+# Paths (auto-discovery resolve nos locais canônicos do Plesk)
 # -----------------------------------------------------------------------------
+# O orquestrador procura cada binário em locais conhecidos
+# (/usr/local/psa/bin, /opt/psa/bin, /usr/sbin) e no $PATH. Só sobrescreva
+# se seu host instalou o Plesk fora do padrão.
+#
+# conf_dir, sessions_dir e session_name NÃO podem ser sobrescritos: o
+# plesk-migrator lê config.ini e escreve sessões em paths fixos relativos
+# ao diretório do módulo panel-migrator. Qualquer override criaria mismatch.
 paths:
-  plesk_migrator_bin: null      # default: /usr/local/psa/admin/sbin/modules/panel-migrator/plesk-migrator
-  conf_dir: null                # default: /usr/local/psa/var/modules/panel-migrator/conf
-  sessions_dir: null            # default: /usr/local/psa/var/modules/panel-migrator/sessions
-  session_name: migration-session
+  plesk_bin: null               # default: auto-discover (plesk binary)
+  plesk_extension_bin: null     # default: auto-discover (extension binary)
+  plesk_migrator_bin: null      # default: auto-discover; resolvido após install
   log_dir: /var/log/plesk-migration-orchestrator
 
 # -----------------------------------------------------------------------------
