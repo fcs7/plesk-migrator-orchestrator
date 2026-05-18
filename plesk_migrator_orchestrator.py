@@ -20,6 +20,7 @@ import logging
 import os
 import pathlib
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -81,6 +82,8 @@ TIMEOUT_TRANSFER = 14400       # 4 h
 TIMEOUT_COPY_CONTENT = 14400   # 4 h cada (web/mail/db)
 TIMEOUT_TEST_ALL = 7200        # 2 h
 TIMEOUT_FIX_DOCROOT = 600      # 10 min — apenas chamadas `plesk bin subscription`
+TIMEOUT_FIX_MAILPATH = 600     # 10 min — auditoria de Maildir paths
+TIMEOUT_CHECK_MAIL_PASSWORDS = 300  # 5 min — query `plesk db` + reset opcional
 
 # Pattern para capturar pares chave=valor com senha em texto livre
 SENSITIVE_KEY_PATTERN = re.compile(
@@ -108,8 +111,10 @@ PHASES_ORDER = [
     "transfer",
     "copy-web",
     "copy-mail",
-    "fix-docroot",
+    "fix-mailpath",
+    "check-mail-passwords",
     "copy-db",
+    "fix-docroot",
     "test",
     "cleanup-config",
 ]
@@ -782,6 +787,43 @@ class PleskMigrationOrchestrator:
             "paths.plesk_migrator_bin no YAML."
         )
 
+    def _list_mail_accounts(self, domain: str) -> list[str]:
+        """Lista contas de e-mail de um domínio via `plesk bin mail --list`.
+        Cache em self._mail_accounts_cache (lazy). Retorna lista de endereços
+        completos (user@dom). Em dry_run sem binário plesk, retorna []."""
+        cache = getattr(self, "_mail_accounts_cache", None)
+        if cache is None:
+            cache = {}
+            self._mail_accounts_cache = cache
+        if domain in cache:
+            return cache[domain]
+        if not self.plesk_bin:
+            cache[domain] = []
+            return []
+        try:
+            proc = subprocess.run(
+                [str(self.plesk_bin), "bin", "mail", "--list", "-domain", domain],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.logger.warning("_list_mail_accounts(%s): %s", domain, exc)
+            cache[domain] = []
+            return []
+        if proc.returncode != 0:
+            self.logger.debug("plesk bin mail --list -domain %s rc=%d stderr=%s",
+                              domain, proc.returncode, proc.stderr.strip()[:200])
+            cache[domain] = []
+            return []
+        suffix = f"@{domain.lower()}"
+        accounts: list[str] = []
+        for line in proc.stdout.splitlines():
+            line = line.strip().lower()
+            if not line.endswith(suffix):
+                continue
+            accounts.append(line)
+        cache[domain] = accounts
+        return accounts
+
     def _load_migrated_domains(self) -> list[str]:
         """Retorna domínios migrados na sessão atual lendo, em ordem:
         successful-subscriptions.<ts> (mais recente), subscriptions-status.json,
@@ -1216,6 +1258,219 @@ class PleskMigrationOrchestrator:
                 log_to=self.log_dir / "fix-docroot.log",
             )
 
+    def fix_mailpath(self) -> None:
+        """Audita (read-only) onde plesk-migrator depositou Maildirs vs onde o
+        Plesk realmente lê. Plesk canonical:
+            /var/qmail/mailnames/<dom>/<user>/Maildir/{cur,new,tmp}
+
+        Para cada conta migrada, verifica se canonical tem mensagens. Se vazio
+        E houver Maildir não-vazio em path cPanel-style alternativo, registra
+        WARNING + counter. Não move arquivos (requer flag opt-in futura). Saída
+        consolidada em <log_dir>/fix-mailpath.log."""
+        self.logger.info("Fase: fix_mailpath")
+        if not self.plesk_bin:
+            self.logger.warning(
+                "fix_mailpath: binário 'plesk' não localizado — skip"
+            )
+            return
+
+        domains = self._load_migrated_domains()
+        if not domains:
+            self.logger.warning(
+                "fix_mailpath: nenhuma subscription migrada encontrada — skip"
+            )
+            return
+
+        report_lines: list[str] = []
+        mismatches = 0
+        ok = 0
+        empty = 0
+
+        def _has_content(p: pathlib.Path) -> bool:
+            for sub in ("cur", "new", "tmp"):
+                d = p / sub
+                if not d.is_dir():
+                    continue
+                try:
+                    if any(d.iterdir()):
+                        return True
+                except OSError:
+                    continue
+            return False
+
+        for domain in domains:
+            accounts = self._list_mail_accounts(domain)
+            if not accounts:
+                self.logger.info("fix_mailpath: %s sem contas listadas — skip", domain)
+                continue
+            for full in accounts:
+                user = full.split("@", 1)[0]
+                canonical = pathlib.Path(
+                    f"/var/qmail/mailnames/{domain}/{user}/Maildir"
+                )
+                alternatives = [
+                    pathlib.Path(f"/var/qmail/mailnames/{domain}/{user}"),
+                    pathlib.Path(f"/var/www/vhosts/{domain}/mail/{domain}/{user}"),
+                    pathlib.Path(f"/var/www/vhosts/{domain}/mail/{user}"),
+                ]
+                if canonical.is_dir() and _has_content(canonical):
+                    ok += 1
+                    continue
+                alt_found = next(
+                    (a for a in alternatives
+                     if a.is_dir() and _has_content(a) and a != canonical),
+                    None,
+                )
+                if alt_found:
+                    mismatches += 1
+                    msg = (
+                        f"MISMATCH: {full} → canonical vazio ({canonical}); "
+                        f"conteúdo em {alt_found}"
+                    )
+                    self.logger.warning("fix_mailpath: %s", msg)
+                    report_lines.append(msg)
+                else:
+                    empty += 1
+                    self.logger.debug(
+                        "fix_mailpath: %s sem mensagens em qualquer path", full
+                    )
+
+        summary = (
+            f"fix_mailpath summary: ok={ok} mismatch={mismatches} empty={empty} "
+            f"total_audited={ok + mismatches + empty}"
+        )
+        self.logger.info(summary)
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            report = self.log_dir / "fix-mailpath.log"
+            with report.open("a", encoding="utf-8") as fh:
+                ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                fh.write(f"# {ts}\n{summary}\n")
+                for line in report_lines:
+                    fh.write(f"{line}\n")
+                fh.write("\n")
+        except OSError as exc:
+            self.logger.warning("fix_mailpath: falha escrevendo report: %s", exc)
+
+        if mismatches > 0:
+            self.logger.warning(
+                "fix_mailpath: %d caixa(s) com Maildir em path não-canônico. "
+                "Inspecione %s/fix-mailpath.log antes de aplicar correção manual "
+                "(rsync + `plesk repair mail`).",
+                mismatches, self.log_dir,
+            )
+
+    def check_mail_passwords(self, *, reset: bool = False) -> None:
+        """Audita contas com password NULL/vazio em psa.accounts. Se reset=True,
+        gera nova senha por conta (secrets.token_urlsafe(16)) e aplica via
+        `plesk bin mail -u <addr> -passwd <pwd>`. Resultado em CSV chmod 600."""
+        self.logger.info("Fase: check_mail_passwords (reset=%s)", reset)
+        if not self.plesk_bin:
+            self.logger.warning(
+                "check_mail_passwords: binário 'plesk' não localizado — skip"
+            )
+            return
+
+        sql = (
+            "SELECT CONCAT(m.mail_name, '@', d.name) AS addr "
+            "FROM mail m "
+            "JOIN domains d ON m.dom_id=d.id "
+            "LEFT JOIN accounts a ON m.account_id=a.id "
+            "WHERE a.password IS NULL OR a.password='' "
+            "ORDER BY d.name, m.mail_name;"
+        )
+        if self.dry_run:
+            self.logger.info(
+                "[DRY-RUN] %s db -Nse \"%s\"", self.plesk_bin, sql.replace('"', '\\"')
+            )
+            return
+
+        try:
+            proc = subprocess.run(
+                [str(self.plesk_bin), "db", "-Nse", sql],
+                capture_output=True, text=True,
+                timeout=TIMEOUT_CHECK_MAIL_PASSWORDS, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise PhaseExecutionError(
+                f"check_mail_passwords: falha chamando `plesk db`: {exc}"
+            ) from exc
+        if proc.returncode != 0:
+            raise PhaseExecutionError(
+                f"check_mail_passwords: plesk db rc={proc.returncode} "
+                f"stderr={proc.stderr.strip()[:300]}"
+            )
+
+        addresses = [ln.strip() for ln in proc.stdout.splitlines()
+                     if ln.strip() and "@" in ln]
+        if not addresses:
+            self.logger.info("check_mail_passwords: 0 contas sem senha.")
+            return
+
+        self.logger.warning(
+            "check_mail_passwords: %d conta(s) sem senha em psa.accounts.",
+            len(addresses),
+        )
+        for addr in addresses[:20]:
+            self.logger.warning("  sem senha: %s", addr)
+        if len(addresses) > 20:
+            self.logger.warning("  ... e mais %d conta(s).", len(addresses) - 20)
+
+        if not reset:
+            self.logger.warning(
+                "check_mail_passwords: rode com --reset-mail-passwords para "
+                "gerar senhas novas (CSV em %s/mail-password-reset.csv).",
+                self.log_dir,
+            )
+            return
+
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = self.log_dir / "mail-password-reset.csv"
+        new_file = not csv_path.exists()
+        try:
+            csv_path.touch(mode=0o600, exist_ok=True)
+            os.chmod(csv_path, 0o600)
+        except OSError as exc:
+            raise PhaseExecutionError(
+                f"check_mail_passwords: não consegui criar {csv_path}: {exc}"
+            ) from exc
+
+        reset_count = 0
+        with csv_path.open("a", encoding="utf-8") as fh:
+            if new_file:
+                fh.write("timestamp,email,new_password\n")
+            for addr in addresses:
+                while True:
+                    new_pwd = secrets.token_urlsafe(16)
+                    if new_pwd[0] not in "-_":
+                        break
+                self.sensitive_values.append(new_pwd)
+                try:
+                    self._run(
+                        [str(self.plesk_bin), "bin", "mail",
+                         "-u", addr, "-passwd", new_pwd],
+                        timeout=60,
+                        log_to=self.log_dir / "check-mail-passwords.log",
+                    )
+                except (PhaseExecutionError, subprocess.CalledProcessError) as exc:
+                    self.logger.error(
+                        "check_mail_passwords: falha resetando %s: %s", addr, exc
+                    )
+                    continue
+                ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                fh.write(f"{ts},{addr},{new_pwd}\n")
+                reset_count += 1
+
+        try:
+            os.chmod(csv_path, 0o600)
+        except OSError:
+            pass
+        self.logger.warning(
+            "check_mail_passwords: %d/%d senha(s) resetada(s). CSV: %s "
+            "(distribua via canal seguro fora-de-banda).",
+            reset_count, len(addresses), csv_path,
+        )
+
     def copy_db_content(self) -> None:
         self.logger.info("Fase: copy_db_content")
         self._require_plesk_migrator_bin()
@@ -1312,6 +1567,9 @@ class PleskMigrationOrchestrator:
         skip_mail_content: bool = False,
         skip_db_content: bool = False,
         skip_fix_docroot: bool = False,
+        skip_fix_mailpath: bool = False,
+        skip_check_mail_passwords: bool = False,
+        reset_mail_passwords: bool = False,
         start_from: str | None = None,
     ) -> None:
         behavior = self.config.get("behavior") or {}
@@ -1329,6 +1587,17 @@ class PleskMigrationOrchestrator:
         )
         skip_fix_docroot = (
             skip_fix_docroot or behavior_skip.get("fix_docroot", False)
+        )
+        skip_fix_mailpath = (
+            skip_fix_mailpath or behavior_skip.get("fix_mailpath", False)
+        )
+        skip_check_mail_passwords = (
+            skip_check_mail_passwords
+            or behavior_skip.get("check_mail_passwords", False)
+        )
+        reset_mail_passwords = (
+            reset_mail_passwords
+            or (behavior.get("reset_mail_passwords", False))
         )
         start_from = start_from or self.start_from or behavior.get("start_from")
 
@@ -1368,8 +1637,12 @@ class PleskMigrationOrchestrator:
              True),
             ("copy-web", self.copy_web_content, not skip_web_content),
             ("copy-mail", self.copy_mail_content, not skip_mail_content),
-            ("fix-docroot", self.fix_docroot, not skip_fix_docroot),
+            ("fix-mailpath", self.fix_mailpath, not skip_fix_mailpath),
+            ("check-mail-passwords",
+             lambda: self.check_mail_passwords(reset=reset_mail_passwords),
+             not skip_check_mail_passwords),
             ("copy-db", self.copy_db_content, not skip_db_content),
+            ("fix-docroot", self.fix_docroot, not skip_fix_docroot),
             ("test", self.test_all, True),
             ("cleanup-config", self.cleanup_config_ini, self.cleanup_config),
         ]
@@ -1441,6 +1714,17 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Pula copy-db-content + flag em transfer-accounts")
     parser.add_argument("--skip-fix-docroot", action="store_true",
                         help="Pula ajuste de www-root pós copy-web (fase fix-docroot)")
+    parser.add_argument("--skip-fix-mailpath", action="store_true",
+                        help="Pula auditoria de path de Maildir pós copy-mail "
+                             "(fase fix-mailpath)")
+    parser.add_argument("--skip-check-mail-passwords", action="store_true",
+                        help="Pula auditoria de senhas vazias em psa.accounts "
+                             "(fase check-mail-passwords)")
+    parser.add_argument("--reset-mail-passwords", action="store_true",
+                        help="Em check-mail-passwords, gera senha nova para "
+                             "cada conta sem senha e grava CSV chmod 600 em "
+                             "<log_dir>/mail-password-reset.csv. Distribuir "
+                             "via canal seguro fora-de-banda.")
     parser.add_argument(
         "--resume", action="store_true",
         help="Retoma sessão existente: pula generate-migration-list se já "
@@ -1529,6 +1813,9 @@ def main(argv: list[str] | None = None) -> int:
             skip_mail_content=args.skip_mail_content,
             skip_db_content=args.skip_db_content,
             skip_fix_docroot=args.skip_fix_docroot,
+            skip_fix_mailpath=args.skip_fix_mailpath,
+            skip_check_mail_passwords=args.skip_check_mail_passwords,
+            reset_mail_passwords=args.reset_mail_passwords,
             start_from=start_from,
         )
     except LockError as exc:
