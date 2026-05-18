@@ -183,7 +183,11 @@ class PleskMigrationOrchestrator:
             raise ValidationError("source.ssh_password deve ser string")
 
         ssh_port = src.get("ssh_port", 22)
-        if not isinstance(ssh_port, int) or not (1 <= ssh_port <= 65535):
+        if (
+            isinstance(ssh_port, bool)
+            or not isinstance(ssh_port, int)
+            or not (1 <= ssh_port <= 65535)
+        ):
             raise ValidationError(
                 "source.ssh_port deve ser inteiro 1..65535"
             )
@@ -282,9 +286,16 @@ class PleskMigrationOrchestrator:
 
     @staticmethod
     def _is_read_only(cmd: list[str]) -> bool:
-        joined = " ".join(cmd).lower()
+        if not cmd:
+            return False
+        # Compara o nome do binário (basename, lowercase) com o 1º token
+        # e o 2º argumento exato com o 2º token — evita falso positivo
+        # com substrings como "help" em "--help".
+        bin_name = os.path.basename(str(cmd[0])).lower()
+        second = str(cmd[1]).lower() if len(cmd) > 1 else ""
         for tokens in _READ_ONLY_COMMANDS:
-            if all(tok in joined for tok in tokens):
+            expected_bin, expected_arg = tokens
+            if bin_name == expected_bin and second == expected_arg:
                 return True
         return False
 
