@@ -83,9 +83,9 @@ sudo ./run.sh --config /etc/plesk-migration.yaml
 ```bash
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase install
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase config
-sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase preflight
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase list
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase filter
+sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase preflight
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase transfer
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase copy-web
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase copy-mail
@@ -116,9 +116,9 @@ Flags CLI sempre sobrescrevem o bloco `behavior.*` do YAML.
 |---|------|-----------|
 | 1 | `install` | Detecta `panel-migrator` via `extension --list`; se ausente, instala via `plesk installer --select-release-current --install-component panel-migrator` |
 | 2 | `config` | Gera `config.ini` em `conf_dir/` com seções `[GLOBAL]`/`[plesk]`/`[cpanel]` (chmod 600) |
-| 3 | `preflight` | Roda `plesk-migrator check` (valida SSH, espaço, versão da origem etc.) |
-| 4 | `list` | Roda `generate-migration-list`; aborta se já existe (use `--force-regenerate`) |
-| 5 | `filter` | Aplica allowlist/denylist em `migration-list` (cria `.bak`); pula se ambas vazias |
+| 3 | `list` | Roda `generate-migration-list`; aborta se já existe (use `--force-regenerate`) |
+| 4 | `filter` | Aplica allowlist/denylist em `migration-list` (cria `.bak`); pula se ambas vazias |
+| 5 | `preflight` | Roda `plesk-migrator check` (valida SSH, espaço, versão da origem etc.). Roda após `filter` porque o check deve refletir a migration-list final |
 | 6 | `transfer` | Roda `transfer-accounts` (com flags `--skip-copy-*-content` opcionais) |
 | 7 | `copy-web` | Roda `copy-web-content` para re-sincronizar arquivos web |
 | 8 | `copy-mail` | Roda `copy-mail-content` para re-sincronizar mailboxes |

@@ -21,6 +21,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 from logging.handlers import RotatingFileHandler
 
 try:
@@ -73,9 +74,9 @@ _READ_ONLY_COMMANDS = (
 PHASES_ORDER = [
     "install",
     "config",
-    "preflight",
     "list",
     "filter",
+    "preflight",
     "transfer",
     "copy-web",
     "copy-mail",
@@ -353,28 +354,47 @@ class PleskMigrationOrchestrator:
                 except BrokenPipeError:
                     pass
 
+            # Timer mata o subprocess se o timeout estourar — necessário
+            # porque o loop `for raw_line in proc.stdout` pode bloquear
+            # indefinidamente quando o processo trava sem emitir newline.
+            timeout_fired = threading.Event()
+            timer: threading.Timer | None = None
+            if timeout is not None and timeout > 0:
+                def _on_timeout() -> None:
+                    timeout_fired.set()
+                    self.logger.error(
+                        "Timeout (%ss) excedido. Encerrando subprocess…",
+                        timeout,
+                    )
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                timer = threading.Timer(timeout, _on_timeout)
+                timer.daemon = True
+                timer.start()
+
             assert proc.stdout is not None
             try:
-                for raw_line in proc.stdout:
-                    line = raw_line.rstrip("\n")
-                    masked = self._mask(line)
-                    collected.append(masked)
-                    self.logger.debug(masked)
-                    if log_fh is not None:
-                        log_fh.write(masked + "\n")
-                        log_fh.flush()
-            except Exception:
-                proc.kill()
-                raise
+                try:
+                    for raw_line in proc.stdout:
+                        line = raw_line.rstrip("\n")
+                        masked = self._mask(line)
+                        collected.append(masked)
+                        self.logger.debug(masked)
+                        if log_fh is not None:
+                            log_fh.write(masked + "\n")
+                            log_fh.flush()
+                except Exception:
+                    proc.kill()
+                    raise
 
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                self.logger.error(
-                    "Timeout (%ss) excedido. Encerrando subprocess…", timeout
-                )
-                proc.kill()
                 proc.wait()
+            finally:
+                if timer is not None:
+                    timer.cancel()
+
+            if timeout_fired.is_set():
                 raise PhaseExecutionError(
                     f"Timeout após {timeout}s em: {masked_cmd}"
                 )
@@ -799,10 +819,12 @@ class PleskMigrationOrchestrator:
             migration_cfg.get("allowlist") or migration_cfg.get("denylist")
         )
 
+        # Ordem: preflight roda DEPOIS de list/filter porque
+        # `plesk-migrator check` valida a migration-list atual e deve ser
+        # re-executado sempre que ela mudar (docs Plesk CLI guide).
         phases: list[tuple[str, callable, bool]] = [
             ("install", self.ensure_plesk_migrator_installed, not skip_install),
             ("config", self.generate_config_ini, True),
-            ("preflight", self.preflight_checks, True),
             ("list", self.generate_migration_list, True),
             ("filter",
              lambda: self.filter_migration_list(
@@ -810,6 +832,7 @@ class PleskMigrationOrchestrator:
                  migration_cfg.get("denylist"),
              ),
              has_filter),
+            ("preflight", self.preflight_checks, True),
             ("transfer",
              lambda: self.transfer_accounts(
                  skip_web=skip_web_content,
