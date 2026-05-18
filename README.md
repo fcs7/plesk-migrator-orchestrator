@@ -30,6 +30,58 @@ sudo ./run.sh --config /etc/plesk-migration.yaml
 
 ---
 
+## Upgrading de uma versão anterior
+
+Se você tinha um YAML feito para uma versão anterior, algumas chaves agora são
+**rejeitadas na validação** (com mensagem de erro clara) ou foram **renomeadas**.
+Remova/ajuste antes de rodar a nova versão.
+
+### Chaves rejeitadas
+
+| Chave antiga | Por que foi rejeitada | O que fazer |
+|---|---|---|
+| `paths.conf_dir` | Auto-discovery resolve; override causa mismatch silencioso com `plesk-migrator` (que lê `config.ini` de path fixo). | Remover do YAML. |
+| `paths.sessions_dir` | Idem — `plesk-migrator` escreve sessões em path fixo. | Remover do YAML. |
+| `paths.session_name` | Idem — nome da sessão é fixo no migrator. | Remover do YAML. |
+| `migration.allowlist` (não-vazio) | Filtro local por linha corrompe `migration-list` estruturada (resellers/customers/plans/domains). | Remover ou esvaziar; ver [Filtragem de migration-list](#filtragem-de-migration-list) para alternativas. |
+| `migration.denylist` (não-vazio) | Idem. | Idem. |
+
+### Fase renomeada
+
+`--only-phase cleanup` virou `--only-phase cleanup-config` (reflete que a fase
+só apaga `config.ini`, não invoca um subcomando do `plesk-migrator`). A flag
+`--cleanup-config` (opt-in) **não** mudou.
+
+### Mensagem de erro que você verá
+
+```
+ERRO de configuração: paths.sessions_dir não pode ser sobrescrito — o orchestrator não propaga esse caminho para o plesk-migrator. Remova a chave do YAML (auto-discovery resolve o caminho real). Ver README seção 'Upgrading'.
+```
+
+### YAML antes / depois (trecho)
+
+```yaml
+# Antes (versão antiga)
+migration:
+  allowlist: ["site1.com"]
+  denylist:  ["teste.site.com"]
+paths:
+  sessions_dir: /usr/local/psa/var/modules/panel-migrator/sessions
+  session_name: migration-session
+```
+
+```yaml
+# Depois
+migration:
+  allowlist: []
+  denylist:  []
+paths:
+  # sessions_dir e session_name removidos — auto-discovery resolve.
+  log_dir: /var/log/plesk-migration-orchestrator
+```
+
+---
+
 ## Pré-requisitos
 
 - **Servidor Plesk Obsidian** rodando no destino (este host).
@@ -100,7 +152,7 @@ sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase copy-web
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase copy-mail
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase copy-db
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase test
-sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase cleanup --cleanup-config
+sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase cleanup-config --cleanup-config
 ```
 
 ### Outras flags
@@ -133,7 +185,7 @@ Flags CLI sempre sobrescrevem o bloco `behavior.*` do YAML.
 | 8 | `copy-mail` | Roda `copy-mail-content` para re-sincronizar mailboxes |
 | 9 | `copy-db` | Roda `copy-db-content` para re-sincronizar bancos |
 | 10 | `test` | Roda `test-all` para validar o resultado |
-| 11 | `cleanup` | Apaga `config.ini` se `--cleanup-config` (default: pula) |
+| 11 | `cleanup-config` | Apaga `config.ini` se `--cleanup-config` (default: pula). **NÃO** invoca subcomando do `plesk-migrator` — só remove a senha do disco |
 
 Cada fase tem timeout configurado (10 min para install, 4 h para transfer e
 cada `copy-*`, 1 h para `generate-list`, 30 min para `check`, 2 h para `test`).
@@ -249,6 +301,11 @@ término ou via signal handler (SIGINT/SIGTERM).
   ```bash
   sudo chmod 600 /etc/plesk-migration.yaml
   ```
+- **Quem edita o YAML controla execução com root**: além da `ssh_password` em
+  texto plano, as chaves `paths.plesk_bin`, `paths.plesk_extension_bin` e
+  `paths.plesk_migrator_bin` viram `argv[0]` em chamadas `subprocess.Popen`
+  rodando como root. Não confie em YAML de origem não controlada — `chmod 600`
+  no arquivo é **essencial, não opcional**.
 - Todos os logs aplicam mascaramento automático de `ssh_password` e
   `postgres_password` (substitui pelo literal `***` em stdout, stderr e
   arquivos por fase).

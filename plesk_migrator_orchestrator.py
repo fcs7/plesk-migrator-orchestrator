@@ -104,7 +104,7 @@ PHASES_ORDER = [
     "copy-mail",
     "copy-db",
     "test",
-    "cleanup",
+    "cleanup-config",
 ]
 
 
@@ -243,7 +243,9 @@ class PleskMigrationOrchestrator:
                 raise ValidationError(
                     f"migration.{key} não é suportado nesta versão — o filtro "
                     "local pode corromper migration-list. Edite a lista "
-                    "manualmente ou use plesk-migrator --migration-list-file."
+                    "manualmente ou use plesk-migrator --migration-list-file. "
+                    "Ver README seções 'Upgrading' e 'Filtragem de "
+                    "migration-list'."
                 )
         cfg["migration"] = {"allowlist": [], "denylist": []}
 
@@ -257,7 +259,8 @@ class PleskMigrationOrchestrator:
                 raise ValidationError(
                     f"paths.{locked} não pode ser sobrescrito — o orchestrator "
                     "não propaga esse caminho para o plesk-migrator. Remova a "
-                    "chave do YAML (auto-discovery resolve o caminho real)."
+                    "chave do YAML (auto-discovery resolve o caminho real). "
+                    "Ver README seção 'Upgrading'."
                 )
         for path_key in (
             "plesk_migrator_bin", "plesk_bin", "plesk_extension_bin", "log_dir",
@@ -994,7 +997,7 @@ class PleskMigrationOrchestrator:
             ("copy-mail", self.copy_mail_content, not skip_mail_content),
             ("copy-db", self.copy_db_content, not skip_db_content),
             ("test", self.test_all, True),
-            ("cleanup", self.cleanup_config_ini, self.cleanup_config),
+            ("cleanup-config", self.cleanup_config_ini, self.cleanup_config),
         ]
 
         self._acquire_lock()
