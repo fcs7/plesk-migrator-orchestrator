@@ -31,6 +31,14 @@ dest:
 migration:
   allowlist: []
   denylist:  []
+  # Map opcional usado por sanitize-list. Default DEFAULT_RESERVED_RENAME em
+  # plesk_migrator_orchestrator.py: webmail→correio, mail→email, etc.
+  # Sobrescreva pra adaptar à convenção do cliente. NÃO ativa rename — flag
+  # --rename-reserved-subdomains OU behavior.rename_reserved_subdomains=true.
+  reserved_renames: {}
+  # Tentativas máximas de retransfer-failed antes de abortar. CLI:
+  # --max-retransfer-attempts N. Default 3.
+  max_retransfer_attempts: 3
 
 # -----------------------------------------------------------------------------
 # Paths (auto-discovery resolve nos locais canônicos do Plesk)
@@ -60,3 +68,17 @@ behavior:
     web_content: false          # --skip-web-content
     mail_content: false         # --skip-mail-content
     db_content: false           # --skip-db-content
+    fix_docroot: false          # --skip-fix-docroot
+    fix_mailpath: false         # --skip-fix-mailpath
+    check_mail_passwords: false # --skip-check-mail-passwords
+    sanitize_list: false        # --skip-sanitize-list
+    fix_limits: false           # --skip-fix-limits
+    retransfer_failed: false    # --skip-retransfer-failed
+    fix_mail_quota: false       # --skip-fix-mail-quota
+    fix_ftp_renames: false      # --skip-fix-ftp-renames
+    fix_dns_conflicts: false    # --skip-fix-dns-conflicts
+  # Opt-ins (default OFF — efeito sobre estado/cliente)
+  rename_reserved_subdomains: false  # --rename-reserved-subdomains
+  apply_dns_cleanup: false           # --apply-dns-cleanup
+  apply_mailpath_fix: false          # --apply-mailpath-fix
+  reset_mail_passwords: false        # --reset-mail-passwords

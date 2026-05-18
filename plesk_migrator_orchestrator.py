@@ -84,6 +84,38 @@ TIMEOUT_TEST_ALL = 7200        # 2 h
 TIMEOUT_FIX_DOCROOT = 600      # 10 min — apenas chamadas `plesk bin subscription`
 TIMEOUT_FIX_MAILPATH = 600     # 10 min — auditoria de Maildir paths
 TIMEOUT_CHECK_MAIL_PASSWORDS = 300  # 5 min — query `plesk db` + reset opcional
+TIMEOUT_FIX_LIMITS = 600       # 10 min — UPDATE Limits + `plesk repair db`
+TIMEOUT_RETRANSFER = 14400     # 4 h — re-roda transfer-accounts pra failed
+TIMEOUT_FIX_MAIL_QUOTA = 300   # 5 min — UPDATE mail.mbox_quota
+TIMEOUT_FIX_DNS = 300          # 5 min — DELETE dns_recs cPanel-only
+TIMEOUT_FTP_AUDIT = 60         # 1 min — leitura de accounts_report_tree
+TIMEOUT_SANITIZE_LIST = 60     # 1 min — regex em migration-list
+
+# Subdomains reservados pelo Plesk (primeiro label do FQDN). Aplicação cPanel
+# que use esses nomes precisa rename — sanitize-list propõe alternativas.
+RESERVED_PLESK_SUBDOMAINS = (
+    "webmail", "mail", "ftp", "ns1", "ns2", "smtp", "imap", "pop", "pop3",
+)
+
+# Hosts criados automaticamente pelo cPanel (e migrados via shallow-dump) que
+# entram em conflito com DNS Plesk. Lista conservadora — evolui via PR.
+CPANEL_ONLY_DNS_HOSTS = ("cpcontacts", "cpanel", "whm", "webdisk")
+
+# Renames default usados por sanitize-list (override via
+# migration.reserved_renames no YAML).
+DEFAULT_RESERVED_RENAME = {
+    "webmail": "correio",
+    "mail": "email",
+    "ftp": "arquivos",
+    "smtp": "smtp2",
+    "imap": "imap2",
+    "pop": "pop2",
+    "pop3": "pop2",
+    "ns1": "dns1",
+    "ns2": "dns2",
+}
+
+MAX_RETRANSFER_ATTEMPTS = 3
 
 # Pattern para capturar pares chave=valor com senha em texto livre
 SENSITIVE_KEY_PATTERN = re.compile(
@@ -106,13 +138,19 @@ PHASES_ORDER = [
     "install",
     "config",
     "list",
+    "sanitize-list",
     "filter",
     "preflight",
     "transfer",
+    "fix-limits",
+    "retransfer-failed",
     "copy-web",
     "copy-mail",
     "fix-mailpath",
     "check-mail-passwords",
+    "fix-mail-quota",
+    "fix-ftp-renames",
+    "fix-dns-conflicts",
     "copy-db",
     "fix-docroot",
     "test",
@@ -267,7 +305,33 @@ class PleskMigrationOrchestrator:
                     "Ver README seções 'Upgrading' e 'Filtragem de "
                     "migration-list'."
                 )
-        cfg["migration"] = {"allowlist": [], "denylist": []}
+        # Preserva reserved_renames + max_retransfer_attempts; reseta apenas
+        # allow/denylist (não-suportados nesta versão).
+        reserved_renames = migration.get("reserved_renames") or {}
+        if not isinstance(reserved_renames, dict):
+            raise ValidationError(
+                "migration.reserved_renames deve ser mapping (ex: webmail: correio)"
+            )
+        if not all(isinstance(k, str) and isinstance(v, str)
+                   for k, v in reserved_renames.items()):
+            raise ValidationError(
+                "migration.reserved_renames: chaves e valores devem ser strings"
+            )
+        max_retr = migration.get("max_retransfer_attempts", 3)
+        if (
+            isinstance(max_retr, bool)
+            or not isinstance(max_retr, int)
+            or not (1 <= max_retr <= 100)
+        ):
+            raise ValidationError(
+                "migration.max_retransfer_attempts deve ser inteiro 1..100"
+            )
+        cfg["migration"] = {
+            "allowlist": [],
+            "denylist": [],
+            "reserved_renames": reserved_renames,
+            "max_retransfer_attempts": max_retr,
+        }
 
         paths = cfg.get("paths") or {}
         # Overrides que o orchestrator NÃO consegue propagar para plesk-migrator
@@ -787,6 +851,65 @@ class PleskMigrationOrchestrator:
             "paths.plesk_migrator_bin no YAML."
         )
 
+    @staticmethod
+    def _sql_escape(value: str) -> str:
+        """Escape minimal pra SQL string literal. Não suporta NULL/bytes.
+        Use só pra nomes de domínio/limit_name (alfa+pontos)."""
+        return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+    def _run_plesk_db(self, sql: str, *, fetch: bool = False,
+                      log_to: pathlib.Path | None = None) -> str:
+        """Executa SQL via `plesk db -Nse`. Retorna stdout (vazio em dry_run
+        ou UPDATE/DELETE). Use fetch=True quando precisa parse output."""
+        if not self.plesk_bin:
+            raise PhaseExecutionError(
+                "_run_plesk_db: binário 'plesk' não localizado"
+            )
+        compact = " ".join(sql.split())
+        if self.dry_run and not self._is_read_only(["plesk", "db"]):
+            self.logger.info("[DRY-RUN] plesk db -Nse \"%s\"", compact[:300])
+            return ""
+        try:
+            proc = subprocess.run(
+                [str(self.plesk_bin), "db", "-Nse", sql],
+                capture_output=True, text=True, timeout=300, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise PhaseExecutionError(
+                f"_run_plesk_db: falha executando: {exc}"
+            ) from exc
+        if proc.returncode != 0:
+            raise PhaseExecutionError(
+                f"_run_plesk_db: rc={proc.returncode} stderr={proc.stderr.strip()[:300]}"
+            )
+        if log_to is not None:
+            try:
+                self.log_dir.mkdir(parents=True, exist_ok=True)
+                with log_to.open("a", encoding="utf-8") as fh:
+                    ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                    fh.write(f"# {ts} SQL\n{sql}\n# rows affected (best-effort):\n{proc.stdout}\n\n")
+            except OSError:
+                pass
+        return proc.stdout
+
+    def _read_failed_set(self, path: pathlib.Path) -> set[str]:
+        """Extrai conjunto de domínios FQDN-válidos de
+        failed-subscriptions.<ts>. Usa o mesmo parser de
+        _load_migrated_domains (regex FQDN + skip cabeçalhos)."""
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return set()
+        out: set[str] = set()
+        for ln in lines:
+            stripped = ln.strip()
+            if not stripped or stripped.startswith("#") or ":" in stripped:
+                continue
+            candidate = stripped.lower()
+            if self._FQDN_RE.match(candidate):
+                out.add(candidate)
+        return out
+
     def _list_mail_accounts(self, domain: str) -> list[str]:
         """Lista contas de e-mail de um domínio via `plesk bin mail --list`.
         Cache em self._mail_accounts_cache (lazy). Retorna lista de endereços
@@ -1137,6 +1260,126 @@ class PleskMigrationOrchestrator:
         )
         return migration_list
 
+    def sanitize_list(self, *, apply_renames: bool = False) -> None:
+        """Detecta hostnames na migration-list cujo primeiro label é reservado
+        pelo Plesk (webmail, mail, ftp, etc). Em modo apply_renames, reescreve
+        migration-list trocando pelo rename configurado em
+        migration.reserved_renames (fallback DEFAULT_RESERVED_RENAME).
+        Sempre grava report em <log_dir>/reserved-subdomains-report.csv.
+        Idempotente: já renomeados não casam mais com lista reservada."""
+        self.logger.info("Fase: sanitize_list (apply_renames=%s)", apply_renames)
+        if not self.sessions_dir:
+            self.logger.warning("sanitize_list: sessions_dir indefinido — skip")
+            return
+        migration_list = self.sessions_dir / self.session_name / "migration-list"
+        if not migration_list.is_file():
+            self.logger.info("sanitize_list: migration-list inexistente — skip "
+                             "(rode --only-phase list primeiro)")
+            return
+
+        migration_cfg = self.config.get("migration") or {}
+        rename_map: dict[str, str] = dict(DEFAULT_RESERVED_RENAME)
+        user_map = migration_cfg.get("reserved_renames") or {}
+        if isinstance(user_map, dict):
+            rename_map.update({str(k): str(v) for k, v in user_map.items()})
+
+        try:
+            content = migration_list.read_text(encoding="utf-8")
+        except OSError as exc:
+            self.logger.warning("sanitize_list: falha lendo %s: %s",
+                                migration_list, exc)
+            return
+        lines = content.splitlines(keepends=True)
+
+        host_re = re.compile(
+            r"^(?P<indent>\s*)(?P<host>[a-z0-9][a-z0-9.-]*\.[a-z0-9.-]+)"
+            r"(?P<rest>\s*)$",
+            re.IGNORECASE,
+        )
+
+        renames: list[tuple[str, str, str]] = []  # (original, proposed, line_excerpt)
+        out_lines: list[str] = []
+        for raw in lines:
+            m = host_re.match(raw)
+            if not m or ":" in raw:
+                out_lines.append(raw)
+                continue
+            host = m.group("host").lower()
+            first_label = host.split(".", 1)[0]
+            if first_label not in RESERVED_PLESK_SUBDOMAINS:
+                out_lines.append(raw)
+                continue
+            replacement_label = rename_map.get(first_label)
+            if not replacement_label:
+                out_lines.append(raw)
+                continue
+            new_host = f"{replacement_label}.{host.split('.', 1)[1]}"
+            renames.append((host, new_host, raw.rstrip()))
+            if apply_renames:
+                out_lines.append(
+                    f"{m.group('indent')}{new_host}{m.group('rest')}"
+                )
+            else:
+                out_lines.append(raw)
+
+        # Grava report (sempre)
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            report = self.log_dir / "reserved-subdomains-report.csv"
+            new_file = not report.exists()
+            with report.open("a", encoding="utf-8") as fh:
+                if new_file:
+                    fh.write("timestamp,original,proposed,reason\n")
+                ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                for original, proposed, _excerpt in renames:
+                    fh.write(f"{ts},{original},{proposed},reserved-plesk-subdomain\n")
+        except OSError as exc:
+            self.logger.warning("sanitize_list: falha gravando report: %s", exc)
+
+        if not renames:
+            self.logger.info("sanitize_list: 0 subdomains reservados encontrados.")
+            return
+
+        self.logger.warning(
+            "sanitize_list: %d subdomain(s) reservado(s) detectado(s):",
+            len(renames),
+        )
+        for original, proposed, _ in renames:
+            self.logger.warning("  %s → %s", original, proposed)
+
+        if not apply_renames:
+            self.logger.warning(
+                "sanitize_list: --rename-reserved-subdomains não passado — "
+                "migration-list intocada. Aplicação cliente pode quebrar se "
+                "referenciar URLs/hostnames. Para aplicar: --rename-reserved-subdomains."
+            )
+            return
+
+        if self.dry_run:
+            self.logger.info(
+                "[DRY-RUN] sanitize_list: escreveria %d rename(s) em %s",
+                len(renames), migration_list,
+            )
+            return
+
+        # Backup + escrita
+        ts_compact = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = migration_list.with_suffix(
+            migration_list.suffix + f".pre-sanitize.{ts_compact}.bak"
+        )
+        try:
+            shutil.copy2(migration_list, backup)
+            migration_list.write_text("".join(out_lines), encoding="utf-8")
+        except OSError as exc:
+            raise PhaseExecutionError(
+                f"sanitize_list: falha gravando migration-list: {exc}"
+            ) from exc
+
+        self.logger.info(
+            "sanitize_list: %d rename(s) aplicado(s); backup em %s",
+            len(renames), backup,
+        )
+
     def filter_migration_list(
         self,
         allowlist: list[str] | None = None,
@@ -1180,6 +1423,127 @@ class PleskMigrationOrchestrator:
             cmd,
             timeout=TIMEOUT_TRANSFER,
             log_to=self.log_dir / "transfer-accounts.log",
+        )
+
+    def fix_limits(self) -> None:
+        """Zera Limits.* (mbox_quota, max_box, max_subdom, max_db, etc) das
+        subscriptions migradas. Sem isso, Plesk recusa criação de mailboxes
+        novas com 'available: 0'. Aplica via SQL direto (sem CLI estável
+        nesta versão Plesk para subscription unplanned). Roda `plesk repair
+        db -y` ao final para invalidar cache de limits.
+
+        Idempotente: UPDATE para -1 em valores já -1 = no-op."""
+        self.logger.info("Fase: fix_limits")
+        if not self.plesk_bin:
+            self.logger.warning("fix_limits: binário 'plesk' não localizado — skip")
+            return
+        domains = self._load_migrated_domains()
+        if not domains:
+            self.logger.warning("fix_limits: 0 domínios — skip")
+            return
+
+        targets = (
+            "mbox_quota", "max_box", "max_subdom", "max_subftp_users",
+            "max_db", "max_maillists", "max_resp", "max_traffic",
+            "max_unlim_db_users", "disk_space", "max_site_builder",
+            "max_wu", "max_dom_aliases", "max_webapps",
+        )
+
+        updated = 0
+        for dom in domains:
+            for lim in targets:
+                sql = (
+                    f"UPDATE Limits SET value='-1' "
+                    f"WHERE id=(SELECT limits_id FROM domains "
+                    f"WHERE name='{self._sql_escape(dom)}') "
+                    f"AND limit_name='{self._sql_escape(lim)}';"
+                )
+                self._run_plesk_db(
+                    sql, log_to=self.log_dir / "fix-limits.log"
+                )
+            updated += 1
+            self.logger.info("fix_limits: %s — Limits.* SET -1", dom)
+
+        if updated and not self.dry_run:
+            try:
+                self._run(
+                    [str(self.plesk_bin), "repair", "db", "-y"],
+                    timeout=TIMEOUT_FIX_LIMITS,
+                    log_to=self.log_dir / "fix-limits.log",
+                    check=False,
+                )
+            except (PhaseExecutionError, subprocess.CalledProcessError) as exc:
+                self.logger.warning(
+                    "fix_limits: `plesk repair db` falhou (não-fatal): %s", exc
+                )
+
+        self.logger.info("fix_limits: %d subscription(s) atualizada(s)", updated)
+
+    def retransfer_failed(
+        self, *, max_attempts: int = MAX_RETRANSFER_ATTEMPTS,
+    ) -> None:
+        """Re-roda plesk-migrator transfer-accounts contra failed-subscriptions
+        mais recente até 0 falhas, max_attempts esgotado, ou mesma lista 2x
+        consecutivas (progresso estagnado). Sem failed → no-op imediato.
+        Idempotente."""
+        self.logger.info(
+            "Fase: retransfer_failed (max_attempts=%d)", max_attempts,
+        )
+        self._require_plesk_migrator_bin()
+        session_dir = self.sessions_dir / self.session_name
+        if not session_dir.is_dir():
+            self.logger.warning("retransfer_failed: session dir ausente — skip")
+            return
+
+        previous_set: set[str] | None = None
+        for attempt in range(1, max_attempts + 1):
+            failed_files = [
+                f for f in sorted(session_dir.glob("failed-subscriptions.*"))
+                if f.suffix != ".bak"
+            ]
+            if not failed_files:
+                self.logger.info("retransfer_failed: 0 falhas pendentes — done")
+                return
+            latest = failed_files[-1]
+            current_set = self._read_failed_set(latest)
+            if not current_set:
+                self.logger.info(
+                    "retransfer_failed: %s sem domínios parseáveis — done",
+                    latest.name,
+                )
+                return
+            if previous_set is not None and previous_set == current_set:
+                self.logger.error(
+                    "retransfer_failed: mesmas %d subscription(s) falhando "
+                    "em 2 iterações consecutivas — aborta loop. Inspecione: %s",
+                    len(current_set), latest,
+                )
+                raise PhaseExecutionError(
+                    "retransfer_failed: progresso estagnado"
+                )
+            self.logger.info(
+                "retransfer_failed: tentativa %d/%d — %d subscription(s) "
+                "em %s",
+                attempt, max_attempts, len(current_set), latest.name,
+            )
+            try:
+                self._run(
+                    [str(self.plesk_migrator_bin), "transfer-accounts",
+                     "--migration-list-file", str(latest)],
+                    timeout=TIMEOUT_RETRANSFER,
+                    log_to=self.log_dir / f"retransfer-attempt-{attempt}.log",
+                    check=False,
+                )
+            except (PhaseExecutionError, subprocess.CalledProcessError) as exc:
+                self.logger.warning(
+                    "retransfer_failed: tentativa %d falhou (continua loop): %s",
+                    attempt, exc,
+                )
+            previous_set = current_set
+
+        self.logger.warning(
+            "retransfer_failed: %d tentativa(s) esgotada(s). Falhas em %s",
+            max_attempts, session_dir,
         )
 
     def copy_web_content(self) -> None:
@@ -1286,16 +1650,17 @@ class PleskMigrationOrchestrator:
                 log_to=self.log_dir / "fix-docroot.log",
             )
 
-    def fix_mailpath(self) -> None:
-        """Audita (read-only) onde plesk-migrator depositou Maildirs vs onde o
-        Plesk realmente lê. Plesk canonical:
-            /var/qmail/mailnames/<dom>/<user>/Maildir/{cur,new,tmp}
+    def fix_mailpath(self, *, apply: bool = False) -> None:
+        """Audita onde plesk-migrator depositou Maildirs vs onde o Plesk
+        canonical lê (/var/qmail/mailnames/<dom>/<user>/Maildir/{cur,new,tmp}).
 
-        Para cada conta migrada, verifica se canonical tem mensagens. Se vazio
-        E houver Maildir não-vazio em path cPanel-style alternativo, registra
-        WARNING + counter. Não move arquivos (requer flag opt-in futura). Saída
-        consolidada em <log_dir>/fix-mailpath.log."""
-        self.logger.info("Fase: fix_mailpath")
+        Modo audit (default): só relata mismatches em <log_dir>/fix-mailpath.log.
+
+        Modo apply (apply=True via --apply-mailpath-fix): rsync -a do path
+        alternativo populado para canonical, depois `plesk repair mail -domain
+        <dom>` (best-effort). Idempotente: skipa se canonical já tem conteúdo.
+        Não remove origem (operador inspeciona antes de limpar)."""
+        self.logger.info("Fase: fix_mailpath (apply=%s)", apply)
         if not self.plesk_bin:
             self.logger.warning(
                 "fix_mailpath: binário 'plesk' não localizado — skip"
@@ -1357,6 +1722,33 @@ class PleskMigrationOrchestrator:
                     )
                     self.logger.warning("fix_mailpath: %s", msg)
                     report_lines.append(msg)
+                    if apply and not self.dry_run:
+                        try:
+                            canonical.mkdir(parents=True, exist_ok=True)
+                            self._run(
+                                ["rsync", "-a",
+                                 f"{alt_found}/", f"{canonical}/"],
+                                timeout=TIMEOUT_FIX_MAILPATH,
+                                log_to=self.log_dir / "fix-mailpath.log",
+                                check=False,
+                            )
+                            report_lines.append(
+                                f"  APPLIED: rsync {alt_found}/ → {canonical}/"
+                            )
+                        except (PhaseExecutionError, subprocess.CalledProcessError,
+                                OSError) as exc:
+                            self.logger.error(
+                                "fix_mailpath: rsync %s → %s falhou: %s",
+                                alt_found, canonical, exc,
+                            )
+                            report_lines.append(
+                                f"  FAILED rsync: {alt_found}/ → {canonical}/: {exc}"
+                            )
+                    elif apply and self.dry_run:
+                        self.logger.info(
+                            "[DRY-RUN] rsync -a %s/ %s/",
+                            alt_found, canonical,
+                        )
                 else:
                     empty += 1
                     self.logger.debug(
@@ -1381,12 +1773,29 @@ class PleskMigrationOrchestrator:
             self.logger.warning("fix_mailpath: falha escrevendo report: %s", exc)
 
         if mismatches > 0:
-            self.logger.warning(
-                "fix_mailpath: %d caixa(s) com Maildir em path não-canônico. "
-                "Inspecione %s/fix-mailpath.log antes de aplicar correção manual "
-                "(rsync + `plesk repair mail`).",
-                mismatches, self.log_dir,
-            )
+            if apply and not self.dry_run and self.plesk_bin:
+                self.logger.info("fix_mailpath: rodando `plesk repair mail` por domínio")
+                for dom in domains:
+                    try:
+                        self._run(
+                            [str(self.plesk_bin), "repair", "mail",
+                             "-domain", dom, "-y"],
+                            timeout=TIMEOUT_FIX_MAILPATH,
+                            log_to=self.log_dir / "fix-mailpath.log",
+                            check=False,
+                        )
+                    except (PhaseExecutionError, subprocess.CalledProcessError) as exc:
+                        self.logger.warning(
+                            "fix_mailpath: plesk repair mail %s falhou: %s",
+                            dom, exc,
+                        )
+            else:
+                self.logger.warning(
+                    "fix_mailpath: %d caixa(s) com Maildir em path não-canônico. "
+                    "Inspecione %s/fix-mailpath.log; para aplicar correção "
+                    "automática: --apply-mailpath-fix.",
+                    mismatches, self.log_dir,
+                )
 
     def check_mail_passwords(self, *, reset: bool = False) -> None:
         """Audita contas com password NULL/vazio em psa.accounts. Se reset=True,
@@ -1499,6 +1908,166 @@ class PleskMigrationOrchestrator:
             reset_count, len(addresses), csv_path,
         )
 
+    def fix_mail_quota(self) -> None:
+        """Zera mbox_quota individual de contas mail migradas. Plesk-migrator
+        preserva quota cPanel literal (`0` = ilimitado lá, = bloqueio aqui).
+        Sem isso contas recebem 0 bytes mesmo após criação. Idempotente:
+        `AND mbox_quota=0` evita re-aplicar."""
+        self.logger.info("Fase: fix_mail_quota")
+        if not self.plesk_bin:
+            self.logger.warning("fix_mail_quota: binário 'plesk' não localizado — skip")
+            return
+        domains = self._load_migrated_domains()
+        if not domains:
+            self.logger.warning("fix_mail_quota: 0 domínios — skip")
+            return
+        placeholders = ",".join(
+            f"'{self._sql_escape(d)}'" for d in domains
+        )
+        sql = (
+            f"UPDATE mail SET mbox_quota=-1 "
+            f"WHERE dom_id IN ("
+            f"SELECT id FROM domains WHERE name IN ({placeholders})) "
+            f"AND mbox_quota=0;"
+        )
+        self._run_plesk_db(
+            sql, log_to=self.log_dir / "fix-mail-quota.log"
+        )
+        self.logger.info(
+            "fix_mail_quota: mbox_quota=-1 aplicado para %d domínio(s)",
+            len(domains),
+        )
+
+    def fix_ftp_renames(self) -> None:
+        """Audita renames automáticos que Plesk fez em logins FTP cPanel-style
+        (`user@domain` → `user_domain`). Grava CSV
+        <log_dir>/ftp-renames.csv com mapeamento para cliente reconfigurar
+        aplicações. Audit-only — rename já feito pelo Plesk."""
+        self.logger.info("Fase: fix_ftp_renames")
+        session_dir = self.sessions_dir / self.session_name
+        if not session_dir.is_dir():
+            self.logger.warning("fix_ftp_renames: session dir ausente — skip")
+            return
+
+        reports = sorted(session_dir.glob("accounts_report_tree.*"))
+        reports = [r for r in reports if r.suffix not in (".bak", ".json")]
+        if not reports:
+            self.logger.info("fix_ftp_renames: nenhum accounts_report_tree.* — skip")
+            return
+        report_path = reports[-1]
+        try:
+            content = report_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            self.logger.warning("fix_ftp_renames: falha lendo %s: %s",
+                                report_path, exc)
+            return
+
+        rename_re = re.compile(
+            r"Login of FTP user '([^']+)' does not conform to Plesk rules\. "
+            r"It was changed to '([^']+)'",
+            re.IGNORECASE,
+        )
+        matches = rename_re.findall(content)
+        if not matches:
+            self.logger.info("fix_ftp_renames: 0 renames detectados em %s",
+                             report_path.name)
+            return
+
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = self.log_dir / "ftp-renames.csv"
+            existing_keys: set[tuple[str, str]] = set()
+            if csv_path.exists():
+                for ln in csv_path.read_text(encoding="utf-8").splitlines()[1:]:
+                    parts = ln.split(",", 3)
+                    if len(parts) >= 3:
+                        existing_keys.add((parts[1], parts[2]))
+            new_file = not csv_path.exists()
+            written = 0
+            with csv_path.open("a", encoding="utf-8") as fh:
+                if new_file:
+                    fh.write("timestamp,original_login,new_login,domain\n")
+                ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                for original, new in matches:
+                    if (original, new) in existing_keys:
+                        continue
+                    domain_part = original.split("@", 1)[1] if "@" in original else ""
+                    fh.write(f"{ts},{original},{new},{domain_part}\n")
+                    written += 1
+                    self.logger.warning(
+                        "fix_ftp_renames: %s → %s (cliente precisa reconfigurar)",
+                        original, new,
+                    )
+            self.logger.info(
+                "fix_ftp_renames: %d rename(s) novos gravado(s); CSV em %s",
+                written, csv_path,
+            )
+        except OSError as exc:
+            self.logger.warning("fix_ftp_renames: falha gravando CSV: %s", exc)
+
+    def fix_dns_conflicts(self, *, apply: bool = False) -> None:
+        """Remove DNS records cPanel-only que conflitam com Plesk
+        (cpcontacts/cpanel/whm/webdisk). Modo default audit (lista no log);
+        com apply=True DELETE direto via SQL. Idempotente."""
+        self.logger.info("Fase: fix_dns_conflicts (apply=%s)", apply)
+        if not self.plesk_bin:
+            self.logger.warning(
+                "fix_dns_conflicts: binário 'plesk' não localizado — skip"
+            )
+            return
+        domains = self._load_migrated_domains()
+        if not domains:
+            self.logger.warning("fix_dns_conflicts: 0 domínios — skip")
+            return
+
+        # Pattern POSIX REGEXP MariaDB: ^(cpcontacts|cpanel|whm|webdisk)\.
+        prefixes = "|".join(CPANEL_ONLY_DNS_HOSTS)
+        for dom in domains:
+            select_sql = (
+                f"SELECT id, host, type FROM dns_recs "
+                f"WHERE domain_id=(SELECT id FROM domains "
+                f"WHERE name='{self._sql_escape(dom)}') "
+                f"AND host REGEXP '^({prefixes})\\\\.';"
+            )
+            try:
+                stdout = self._run_plesk_db(select_sql, fetch=True)
+            except PhaseExecutionError as exc:
+                self.logger.warning(
+                    "fix_dns_conflicts: falha consultando %s: %s", dom, exc
+                )
+                continue
+            hits = [ln for ln in stdout.splitlines() if ln.strip()]
+            if not hits:
+                continue
+            self.logger.warning(
+                "fix_dns_conflicts: %s — %d record(s) cPanel-only:",
+                dom, len(hits),
+            )
+            for h in hits[:10]:
+                self.logger.warning("  %s", h)
+            if not apply:
+                continue
+            delete_sql = (
+                f"DELETE FROM dns_recs "
+                f"WHERE domain_id=(SELECT id FROM domains "
+                f"WHERE name='{self._sql_escape(dom)}') "
+                f"AND host REGEXP '^({prefixes})\\\\.';"
+            )
+            self._run_plesk_db(
+                delete_sql, log_to=self.log_dir / "fix-dns-conflicts.log"
+            )
+            if not self.dry_run:
+                self.logger.info(
+                    "fix_dns_conflicts: %s — %d record(s) removidos",
+                    dom, len(hits),
+                )
+
+        if not apply:
+            self.logger.warning(
+                "fix_dns_conflicts: --apply-dns-cleanup não passado — "
+                "nada removido (audit-only). Inspect ftp-renames/log."
+            )
+
     def copy_db_content(self) -> None:
         self.logger.info("Fase: copy_db_content")
         self._require_plesk_migrator_bin()
@@ -1598,6 +2167,16 @@ class PleskMigrationOrchestrator:
         skip_fix_mailpath: bool = False,
         skip_check_mail_passwords: bool = False,
         reset_mail_passwords: bool = False,
+        skip_sanitize_list: bool = False,
+        rename_reserved_subdomains: bool = False,
+        skip_fix_limits: bool = False,
+        skip_retransfer_failed: bool = False,
+        max_retransfer_attempts: int = MAX_RETRANSFER_ATTEMPTS,
+        skip_fix_mail_quota: bool = False,
+        skip_fix_ftp_renames: bool = False,
+        skip_fix_dns_conflicts: bool = False,
+        apply_dns_cleanup: bool = False,
+        apply_mailpath_fix: bool = False,
         start_from: str | None = None,
     ) -> None:
         behavior = self.config.get("behavior") or {}
@@ -1627,6 +2206,36 @@ class PleskMigrationOrchestrator:
             reset_mail_passwords
             or (behavior.get("reset_mail_passwords", False))
         )
+        skip_sanitize_list = (
+            skip_sanitize_list or behavior_skip.get("sanitize_list", False)
+        )
+        rename_reserved_subdomains = (
+            rename_reserved_subdomains
+            or behavior.get("rename_reserved_subdomains", False)
+        )
+        skip_fix_limits = (
+            skip_fix_limits or behavior_skip.get("fix_limits", False)
+        )
+        skip_retransfer_failed = (
+            skip_retransfer_failed
+            or behavior_skip.get("retransfer_failed", False)
+        )
+        skip_fix_mail_quota = (
+            skip_fix_mail_quota or behavior_skip.get("fix_mail_quota", False)
+        )
+        skip_fix_ftp_renames = (
+            skip_fix_ftp_renames or behavior_skip.get("fix_ftp_renames", False)
+        )
+        skip_fix_dns_conflicts = (
+            skip_fix_dns_conflicts
+            or behavior_skip.get("fix_dns_conflicts", False)
+        )
+        apply_dns_cleanup = (
+            apply_dns_cleanup or behavior.get("apply_dns_cleanup", False)
+        )
+        apply_mailpath_fix = (
+            apply_mailpath_fix or behavior.get("apply_mailpath_fix", False)
+        )
         start_from = start_from or self.start_from or behavior.get("start_from")
 
         if self.resume:
@@ -1648,6 +2257,11 @@ class PleskMigrationOrchestrator:
             ("install", self.ensure_plesk_migrator_installed, not skip_install),
             ("config", self.generate_config_ini, True),
             ("list", self.generate_migration_list, True),
+            ("sanitize-list",
+             lambda: self.sanitize_list(
+                 apply_renames=rename_reserved_subdomains,
+             ),
+             not skip_sanitize_list),
             ("filter",
              lambda: self.filter_migration_list(
                  migration_cfg.get("allowlist"),
@@ -1663,12 +2277,25 @@ class PleskMigrationOrchestrator:
                  start_from=start_from,
              ),
              True),
+            ("fix-limits", self.fix_limits, not skip_fix_limits),
+            ("retransfer-failed",
+             lambda: self.retransfer_failed(
+                 max_attempts=max_retransfer_attempts,
+             ),
+             not skip_retransfer_failed),
             ("copy-web", self.copy_web_content, not skip_web_content),
             ("copy-mail", self.copy_mail_content, not skip_mail_content),
-            ("fix-mailpath", self.fix_mailpath, not skip_fix_mailpath),
+            ("fix-mailpath",
+             lambda: self.fix_mailpath(apply=apply_mailpath_fix),
+             not skip_fix_mailpath),
             ("check-mail-passwords",
              lambda: self.check_mail_passwords(reset=reset_mail_passwords),
              not skip_check_mail_passwords),
+            ("fix-mail-quota", self.fix_mail_quota, not skip_fix_mail_quota),
+            ("fix-ftp-renames", self.fix_ftp_renames, not skip_fix_ftp_renames),
+            ("fix-dns-conflicts",
+             lambda: self.fix_dns_conflicts(apply=apply_dns_cleanup),
+             not skip_fix_dns_conflicts),
             ("copy-db", self.copy_db_content, not skip_db_content),
             ("fix-docroot", self.fix_docroot, not skip_fix_docroot),
             ("test", self.test_all, True),
@@ -1753,6 +2380,35 @@ def _build_parser() -> argparse.ArgumentParser:
                              "cada conta sem senha e grava CSV chmod 600 em "
                              "<log_dir>/mail-password-reset.csv. Distribuir "
                              "via canal seguro fora-de-banda.")
+    parser.add_argument("--skip-sanitize-list", action="store_true",
+                        help="Pula auditoria de subdomains reservados Plesk "
+                             "(fase sanitize-list)")
+    parser.add_argument("--rename-reserved-subdomains", action="store_true",
+                        help="Em sanitize-list, reescreve migration-list "
+                             "renomeando webmail.<dom>/mail.<dom>/etc para "
+                             "alternativas (correio/email/...). Backup .bak.")
+    parser.add_argument("--skip-fix-limits", action="store_true",
+                        help="Pula UPDATE Limits.* (fase fix-limits)")
+    parser.add_argument("--skip-retransfer-failed", action="store_true",
+                        help="Pula auto-retry de failed-subscriptions "
+                             "(fase retransfer-failed)")
+    parser.add_argument("--max-retransfer-attempts", type=int, default=None,
+                        help=f"Máximo de tentativas em retransfer-failed "
+                             f"(default: {MAX_RETRANSFER_ATTEMPTS})")
+    parser.add_argument("--skip-fix-mail-quota", action="store_true",
+                        help="Pula UPDATE mail.mbox_quota (fase fix-mail-quota)")
+    parser.add_argument("--skip-fix-ftp-renames", action="store_true",
+                        help="Pula auditoria de FTP renames (fase fix-ftp-renames)")
+    parser.add_argument("--skip-fix-dns-conflicts", action="store_true",
+                        help="Pula detecção de DNS cPanel-only "
+                             "(fase fix-dns-conflicts)")
+    parser.add_argument("--apply-dns-cleanup", action="store_true",
+                        help="Em fix-dns-conflicts, DELETE registros DNS "
+                             "cPanel-only (cpcontacts/cpanel/whm/webdisk).")
+    parser.add_argument("--apply-mailpath-fix", action="store_true",
+                        help="Em fix-mailpath, rsync Maildirs em path "
+                             "alternativo para canonical Plesk + "
+                             "`plesk repair mail`.")
     parser.add_argument(
         "--resume", action="store_true",
         help="Retoma sessão existente: pula generate-migration-list se já "
@@ -1844,6 +2500,22 @@ def main(argv: list[str] | None = None) -> int:
             skip_fix_mailpath=args.skip_fix_mailpath,
             skip_check_mail_passwords=args.skip_check_mail_passwords,
             reset_mail_passwords=args.reset_mail_passwords,
+            skip_sanitize_list=args.skip_sanitize_list,
+            rename_reserved_subdomains=args.rename_reserved_subdomains,
+            skip_fix_limits=args.skip_fix_limits,
+            skip_retransfer_failed=args.skip_retransfer_failed,
+            max_retransfer_attempts=(
+                args.max_retransfer_attempts
+                if args.max_retransfer_attempts is not None
+                else (config.get("migration") or {}).get(
+                    "max_retransfer_attempts", MAX_RETRANSFER_ATTEMPTS
+                )
+            ),
+            skip_fix_mail_quota=args.skip_fix_mail_quota,
+            skip_fix_ftp_renames=args.skip_fix_ftp_renames,
+            skip_fix_dns_conflicts=args.skip_fix_dns_conflicts,
+            apply_dns_cleanup=args.apply_dns_cleanup,
+            apply_mailpath_fix=args.apply_mailpath_fix,
             start_from=start_from,
         )
     except LockError as exc:
