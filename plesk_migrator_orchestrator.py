@@ -824,10 +824,26 @@ class PleskMigrationOrchestrator:
         cache[domain] = accounts
         return accounts
 
+    _FQDN_RE = re.compile(
+        r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
+    )
+
     def _load_migrated_domains(self) -> list[str]:
         """Retorna domínios migrados na sessão atual lendo, em ordem:
         successful-subscriptions.<ts> (mais recente), subscriptions-status.json,
-        subscriptions-report.json. Vazio = nenhuma evidência de migração."""
+        subscriptions-report.json. Vazio = nenhuma evidência de migração.
+
+        Formato de successful-subscriptions.<ts> (Plesk Migrator nativo):
+            # Admin subscriptions and customers
+                Customer: <name>
+                        domain1.example
+                        domain2.example
+                Reseller: <name>
+                Plan: <name>
+                        ...
+        Parser aceita só linhas FQDN-válidas (regex), descarta cabeçalhos
+        (Customer:/Reseller:/Plan:/...) e comentários."""
         session_dir = self.sessions_dir / self.session_name
         if not session_dir.is_dir():
             return []
@@ -839,12 +855,24 @@ class PleskMigrationOrchestrator:
             try:
                 lines = cand.read_text(encoding="utf-8").splitlines()
             except OSError as exc:
-                self.logger.warning("fix_docroot: falha lendo %s: %s", cand, exc)
+                self.logger.warning("_load_migrated_domains: falha lendo %s: %s",
+                                    cand, exc)
                 continue
-            domains = [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
+            domains: list[str] = []
+            for ln in lines:
+                stripped = ln.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if ":" in stripped:
+                    continue
+                candidate = stripped.lower()
+                if self._FQDN_RE.match(candidate):
+                    domains.append(candidate)
             if domains:
-                self.logger.debug("fix_docroot: %d domínios carregados de %s",
-                                  len(domains), cand.name)
+                self.logger.debug(
+                    "_load_migrated_domains: %d domínio(s) de %s",
+                    len(domains), cand.name,
+                )
                 return domains
 
         for jsonfile in ("subscriptions-status.json", "subscriptions-report.json"):
