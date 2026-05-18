@@ -80,6 +80,7 @@ TIMEOUT_CHECK = 1800           # 30 min
 TIMEOUT_TRANSFER = 14400       # 4 h
 TIMEOUT_COPY_CONTENT = 14400   # 4 h cada (web/mail/db)
 TIMEOUT_TEST_ALL = 7200        # 2 h
+TIMEOUT_FIX_DOCROOT = 600      # 10 min — apenas chamadas `plesk bin subscription`
 
 # Pattern para capturar pares chave=valor com senha em texto livre
 SENSITIVE_KEY_PATTERN = re.compile(
@@ -107,6 +108,7 @@ PHASES_ORDER = [
     "transfer",
     "copy-web",
     "copy-mail",
+    "fix-docroot",
     "copy-db",
     "test",
     "cleanup-config",
@@ -780,6 +782,55 @@ class PleskMigrationOrchestrator:
             "paths.plesk_migrator_bin no YAML."
         )
 
+    def _load_migrated_domains(self) -> list[str]:
+        """Retorna domínios migrados na sessão atual lendo, em ordem:
+        successful-subscriptions.<ts> (mais recente), subscriptions-status.json,
+        subscriptions-report.json. Vazio = nenhuma evidência de migração."""
+        session_dir = self.sessions_dir / self.session_name
+        if not session_dir.is_dir():
+            return []
+
+        candidates = sorted(session_dir.glob("successful-subscriptions.*"))
+        for cand in reversed(candidates):
+            if cand.suffix == ".bak":
+                continue
+            try:
+                lines = cand.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                self.logger.warning("fix_docroot: falha lendo %s: %s", cand, exc)
+                continue
+            domains = [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
+            if domains:
+                self.logger.debug("fix_docroot: %d domínios carregados de %s",
+                                  len(domains), cand.name)
+                return domains
+
+        for jsonfile in ("subscriptions-status.json", "subscriptions-report.json"):
+            path = session_dir / jsonfile
+            if not path.is_file():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                self.logger.warning("fix_docroot: falha lendo %s: %s", path, exc)
+                continue
+            if isinstance(data, dict):
+                ok_states = {"completed", "success", "successful", "done", "ok"}
+                domains = [
+                    name for name, info in data.items()
+                    if isinstance(info, dict) and (
+                        str(info.get("status", "")).lower() in ok_states
+                        or str(info.get("state", "")).lower() in ok_states
+                    )
+                ]
+                if not domains:
+                    domains = list(data.keys())
+                if domains:
+                    self.logger.debug("fix_docroot: %d domínios carregados de %s",
+                                      len(domains), path.name)
+                    return domains
+        return []
+
     def ensure_plesk_migrator_installed(self) -> None:
         self.logger.info("Fase: ensure_plesk_migrator_installed")
         if not self.plesk_extension_bin:
@@ -1081,6 +1132,90 @@ class PleskMigrationOrchestrator:
             log_to=self.log_dir / "copy-mail.log",
         )
 
+    def fix_docroot(self) -> None:
+        """Ajusta www-root das subscriptions migradas quando plesk-migrator
+        depositou conteúdo em `public_html/` (layout cPanel preservado) mas a
+        subscription Plesk continua apontando para `httpdocs/` (default vazio).
+
+        Idempotente:
+          - skip se vhost ausente
+          - skip se public_html vazio (nada a apontar)
+          - skip se httpdocs já populado (não-vazio = docroot ok ou usuário
+            já corrigiu)
+        """
+        self.logger.info("Fase: fix_docroot")
+        if not self.plesk_bin:
+            raise PhaseExecutionError(
+                "fix_docroot: binário 'plesk' não localizado. "
+                "Necessário para `plesk bin subscription`."
+            )
+
+        domains = self._load_migrated_domains()
+        if not domains:
+            self.logger.warning(
+                "fix_docroot: nenhuma subscription migrada encontrada em %s — skip",
+                self.sessions_dir / self.session_name,
+            )
+            return
+
+        vhosts_root = pathlib.Path("/var/www/vhosts")
+        for domain in domains:
+            vhost = vhosts_root / domain
+            httpdocs = vhost / "httpdocs"
+            public_html = vhost / "public_html"
+
+            if not vhost.is_dir():
+                self.logger.warning(
+                    "fix_docroot: vhost %s ausente — skip", vhost
+                )
+                continue
+            if not public_html.is_dir():
+                self.logger.info(
+                    "fix_docroot: %s sem public_html — skip", domain
+                )
+                continue
+            try:
+                ph_has_content = any(public_html.iterdir())
+            except OSError as exc:
+                self.logger.warning(
+                    "fix_docroot: erro lendo %s: %s — skip", public_html, exc
+                )
+                continue
+            if not ph_has_content:
+                self.logger.info(
+                    "fix_docroot: %s public_html vazio — skip", domain
+                )
+                continue
+            try:
+                ht_has_content = httpdocs.is_dir() and any(httpdocs.iterdir())
+            except OSError as exc:
+                self.logger.warning(
+                    "fix_docroot: erro lendo %s: %s — skip", httpdocs, exc
+                )
+                continue
+            if ht_has_content:
+                self.logger.info(
+                    "fix_docroot: %s httpdocs já populado — skip", domain
+                )
+                continue
+
+            self.logger.info(
+                "fix_docroot: ajustando www-root de %s → %s", domain, public_html
+            )
+            if self.dry_run:
+                self.logger.info(
+                    "[DRY-RUN] %s bin subscription -u %s -www-root %s",
+                    self.plesk_bin, domain, public_html,
+                )
+                continue
+
+            self._run(
+                [str(self.plesk_bin), "bin", "subscription",
+                 "-u", domain, "-www-root", str(public_html)],
+                timeout=TIMEOUT_FIX_DOCROOT,
+                log_to=self.log_dir / "fix-docroot.log",
+            )
+
     def copy_db_content(self) -> None:
         self.logger.info("Fase: copy_db_content")
         self._require_plesk_migrator_bin()
@@ -1176,6 +1311,7 @@ class PleskMigrationOrchestrator:
         skip_web_content: bool = False,
         skip_mail_content: bool = False,
         skip_db_content: bool = False,
+        skip_fix_docroot: bool = False,
         start_from: str | None = None,
     ) -> None:
         behavior = self.config.get("behavior") or {}
@@ -1190,6 +1326,9 @@ class PleskMigrationOrchestrator:
         )
         skip_db_content = (
             skip_db_content or behavior_skip.get("db_content", False)
+        )
+        skip_fix_docroot = (
+            skip_fix_docroot or behavior_skip.get("fix_docroot", False)
         )
         start_from = start_from or self.start_from or behavior.get("start_from")
 
@@ -1229,6 +1368,7 @@ class PleskMigrationOrchestrator:
              True),
             ("copy-web", self.copy_web_content, not skip_web_content),
             ("copy-mail", self.copy_mail_content, not skip_mail_content),
+            ("fix-docroot", self.fix_docroot, not skip_fix_docroot),
             ("copy-db", self.copy_db_content, not skip_db_content),
             ("test", self.test_all, True),
             ("cleanup-config", self.cleanup_config_ini, self.cleanup_config),
@@ -1299,6 +1439,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Pula copy-mail-content + flag em transfer-accounts")
     parser.add_argument("--skip-db-content", action="store_true",
                         help="Pula copy-db-content + flag em transfer-accounts")
+    parser.add_argument("--skip-fix-docroot", action="store_true",
+                        help="Pula ajuste de www-root pós copy-web (fase fix-docroot)")
     parser.add_argument(
         "--resume", action="store_true",
         help="Retoma sessão existente: pula generate-migration-list se já "
@@ -1386,6 +1528,7 @@ def main(argv: list[str] | None = None) -> int:
             skip_web_content=args.skip_web_content,
             skip_mail_content=args.skip_mail_content,
             skip_db_content=args.skip_db_content,
+            skip_fix_docroot=args.skip_fix_docroot,
             start_from=start_from,
         )
     except LockError as exc:
