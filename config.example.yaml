@@ -1,0 +1,47 @@
+# Plesk Migrator Orchestrator — template de configuração
+# Após editar: chmod 600 /etc/plesk-migration.yaml (contém senha em texto plano)
+
+# -----------------------------------------------------------------------------
+# Origem cPanel/WHM
+# -----------------------------------------------------------------------------
+source:
+  host: 192.0.2.10              # IP/hostname do servidor cPanel
+  ssh_port: 22                  # opcional (default 22)
+  ssh_password: "TROQUE_AQUI"   # senha root cPanel — SENSÍVEL, não commitar
+  postgres_password: null       # opcional; preencha se origem tem PostgreSQL
+
+# -----------------------------------------------------------------------------
+# Destino Plesk (este servidor — onde o orquestrador roda)
+# -----------------------------------------------------------------------------
+dest:
+  host: 192.0.2.20              # IP/hostname do servidor Plesk Obsidian
+
+# -----------------------------------------------------------------------------
+# Filtros de migração (vazio = migra tudo da migration-list)
+# -----------------------------------------------------------------------------
+migration:
+  allowlist: []                 # ex: ["site1.com", "site2.com"] — só migra esses
+  denylist:  []                 # ex: ["teste.site.com"] — exclui esses
+
+# -----------------------------------------------------------------------------
+# Paths (null = usa defaults oficiais do Plesk)
+# -----------------------------------------------------------------------------
+paths:
+  plesk_migrator_bin: null      # default: /usr/local/psa/admin/sbin/modules/panel-migrator/plesk-migrator
+  conf_dir: null                # default: /usr/local/psa/var/modules/panel-migrator/conf
+  sessions_dir: null            # default: /usr/local/psa/var/modules/panel-migrator/sessions
+  session_name: migration-session
+  log_dir: /var/log/plesk-migration-orchestrator
+
+# -----------------------------------------------------------------------------
+# Comportamento (flags CLI sobrescrevem)
+# -----------------------------------------------------------------------------
+behavior:
+  dry_run: false                # --dry-run
+  skip_install: false           # --skip-install
+  force_regenerate: false       # --force-regenerate (sobrescreve migration-list)
+  cleanup_config: false         # --cleanup-config (apaga config.ini ao final)
+  skip:
+    web_content: false          # --skip-web-content
+    mail_content: false         # --skip-mail-content
+    db_content: false           # --skip-db-content
