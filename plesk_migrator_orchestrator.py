@@ -293,16 +293,26 @@ class PleskMigrationOrchestrator:
         label: str,
         optional: bool = False,
     ) -> pathlib.Path | None:
-        """Resolve um binário: override YAML > candidatos fixos > $PATH."""
+        """Resolve um binário: override YAML > candidatos fixos > $PATH.
+
+        Override é validado de forma rigorosa: se o arquivo não existe ou não
+        é executável, raise ValidationError (em vez de devolver path inválido
+        e deixar FileNotFoundError vazar mais tarde com traceback feio).
+        Auto-discovery sem override permanece leniente conforme `optional`.
+        """
         if override:
             p = pathlib.Path(override)
-            if p.exists():
-                return p
-            self.logger.warning(
-                "paths.%s configurado para %s mas o arquivo não existe",
-                label, override,
-            )
-            return p  # Devolve mesmo assim; falha clara depois ao executar.
+            if not p.is_file():
+                raise ValidationError(
+                    f"paths.{label} aponta para {override} mas o arquivo "
+                    "não existe (ou não é arquivo regular)."
+                )
+            if not os.access(p, os.X_OK):
+                raise ValidationError(
+                    f"paths.{label} aponta para {override} mas não é "
+                    "executável (chmod +x?)."
+                )
+            return p
         for cand in candidates:
             cp = pathlib.Path(cand)
             if cp.exists():
@@ -518,13 +528,20 @@ class PleskMigrationOrchestrator:
             timer: threading.Timer | None = None
             if timeout is not None and timeout > 0:
                 def _on_timeout() -> None:
+                    # SIGTERM + grace antes de SIGKILL — fases longas (transfer,
+                    # copy-*) podem ter rsync/SSH ativos na origem; matar direto
+                    # deixa locks e conexões zumbis na sessão do Plesk Migrator.
                     timeout_fired.set()
                     self.logger.error(
-                        "Timeout (%ss) excedido. Encerrando subprocess…",
+                        "Timeout (%ss) excedido. SIGTERM → wait 15s → SIGKILL.",
                         timeout,
                     )
                     try:
-                        proc.kill()
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=15)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
                     except ProcessLookupError:
                         pass
                 timer = threading.Timer(timeout, _on_timeout)
@@ -595,6 +612,7 @@ class PleskMigrationOrchestrator:
         self.logger.debug("Lock adquirido em %s", LOCK_FILE)
 
     def _release_lock(self) -> None:
+        # async-signal-safe: nada de self.logger aqui (ver _cleanup_subprocess).
         if self._lock_fd is not None:
             try:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
@@ -605,16 +623,24 @@ class PleskMigrationOrchestrator:
             except OSError:
                 pass
             self._lock_fd = None
-            self.logger.debug("Lock liberado")
 
     def _install_signal_handlers(self) -> None:
         signal.signal(signal.SIGINT, self._cleanup_subprocess)
         signal.signal(signal.SIGTERM, self._cleanup_subprocess)
 
     def _cleanup_subprocess(self, signum=None, frame=None) -> None:
-        self.logger.warning(
-            "Sinal %s recebido. Encerrando subprocess…", signum
-        )
+        # NÃO usar self.logger aqui: o módulo logging usa lock interno e
+        # signals podem interromper outra thread que já está logando — re-entrar
+        # no mesmo lock causa deadlock. Usamos os.write para o stderr direto,
+        # que é async-signal-safe.
+        try:
+            os.write(
+                2,
+                f"\n[SIGNAL] Sinal {signum} recebido — encerrando subprocess…\n"
+                .encode("utf-8"),
+            )
+        except OSError:
+            pass
         proc = self._current_proc
         if proc is not None and proc.poll() is None:
             proc.terminate()
@@ -628,6 +654,33 @@ class PleskMigrationOrchestrator:
     # ------------------------------------------------------------------
     # Fases (§7 spec)
     # ------------------------------------------------------------------
+
+    def _require_runtime_state(self) -> None:
+        """Aborta se config.ini/migration-list faltam (pré-req de fases pós-list).
+
+        Sem isso, `--only-phase transfer` (ou copy-*, test, preflight) num
+        diretório limpo deixaria o plesk-migrator falhar com erro críptico
+        em vez do orchestrator avisar qual fase rodar antes.
+
+        Skip em dry-run (estado real não é gerado nesse modo).
+        """
+        if self.dry_run:
+            return
+        config_path = self.conf_dir / "config.ini"
+        migration_list = self.sessions_dir / self.session_name / "migration-list"
+        missing: list[str] = []
+        if not config_path.exists():
+            missing.append(
+                f"config.ini não existe em {config_path} — rode "
+                "--only-phase config primeiro"
+            )
+        if not migration_list.exists():
+            missing.append(
+                f"migration-list não existe em {migration_list} — rode "
+                "--only-phase list primeiro"
+            )
+        if missing:
+            raise PhaseExecutionError("; ".join(missing))
 
     def _require_plesk_migrator_bin(self) -> None:
         """Garante plesk-migrator localizado; em dry-run usa placeholder canônico."""
@@ -796,6 +849,7 @@ class PleskMigrationOrchestrator:
             )
             return
         self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         try:
             self._run(
                 [str(self.plesk_migrator_bin), "check"],
@@ -840,9 +894,14 @@ class PleskMigrationOrchestrator:
                 "após generate-migration-list."
             )
 
-        line_count = sum(
-            1 for _ in migration_list.open("r", encoding="utf-8", errors="replace")
-        )
+        with migration_list.open("r", encoding="utf-8", errors="replace") as fh:
+            line_count = sum(1 for _ in fh)
+        if line_count == 0:
+            raise PhaseExecutionError(
+                f"migration-list em {migration_list} foi gerada vazia. "
+                "Verifique conexão SSH, credenciais e se há contas válidas "
+                "na origem."
+            )
         self.logger.info(
             "migration-list gerada (%d linhas) em %s",
             line_count, migration_list,
@@ -871,6 +930,7 @@ class PleskMigrationOrchestrator:
     ) -> None:
         self.logger.info("Fase: transfer_accounts")
         self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         cmd = [str(self.plesk_migrator_bin), "transfer-accounts"]
         if skip_web:
             cmd.append("--skip-copy-web-content")
@@ -890,6 +950,7 @@ class PleskMigrationOrchestrator:
     def copy_web_content(self) -> None:
         self.logger.info("Fase: copy_web_content")
         self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         self._run(
             [str(self.plesk_migrator_bin), "copy-web-content"],
             timeout=TIMEOUT_COPY_CONTENT,
@@ -899,6 +960,7 @@ class PleskMigrationOrchestrator:
     def copy_mail_content(self) -> None:
         self.logger.info("Fase: copy_mail_content")
         self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         self._run(
             [str(self.plesk_migrator_bin), "copy-mail-content"],
             timeout=TIMEOUT_COPY_CONTENT,
@@ -908,6 +970,7 @@ class PleskMigrationOrchestrator:
     def copy_db_content(self) -> None:
         self.logger.info("Fase: copy_db_content")
         self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         self._run(
             [str(self.plesk_migrator_bin), "copy-db-content"],
             timeout=TIMEOUT_COPY_CONTENT,
@@ -917,6 +980,7 @@ class PleskMigrationOrchestrator:
     def test_all(self) -> None:
         self.logger.info("Fase: test_all")
         self._require_plesk_migrator_bin()
+        self._require_runtime_state()
         self._run(
             [str(self.plesk_migrator_bin), "test-all"],
             timeout=TIMEOUT_TEST_ALL,
