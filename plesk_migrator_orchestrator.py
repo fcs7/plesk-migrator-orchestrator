@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import datetime as _dt
 import fcntl
+import hashlib
+import json
 import logging
 import os
 import pathlib
@@ -149,12 +152,20 @@ class PleskMigrationOrchestrator:
         force_regenerate: bool = False,
         cleanup_config: bool = False,
         verbose: bool = False,
+        resume: bool = False,
+        start_from: str | None = None,
     ) -> None:
         self.config = config or {}
         self.dry_run = dry_run
         self.force_regenerate = force_regenerate
         self.cleanup_config = cleanup_config
         self.verbose = verbose
+        self.resume = resume
+        self.start_from = start_from
+        if resume and force_regenerate:
+            raise ValidationError(
+                "resume e force_regenerate são mutuamente exclusivos"
+            )
 
         self._validate_config()
 
@@ -279,9 +290,12 @@ class PleskMigrationOrchestrator:
             if key in skip and not isinstance(skip[key], bool):
                 raise ValidationError(f"behavior.skip.{key} deve ser bool")
         for key in ("dry_run", "skip_install", "force_regenerate",
-                    "cleanup_config"):
+                    "cleanup_config", "resume"):
             if key in behavior and not isinstance(behavior[key], bool):
                 raise ValidationError(f"behavior.{key} deve ser bool")
+        if "start_from" in behavior and behavior["start_from"] is not None:
+            if not isinstance(behavior["start_from"], str):
+                raise ValidationError("behavior.start_from deve ser string")
 
     # ------------------------------------------------------------------
     # Auto-discovery de caminhos
@@ -950,11 +964,23 @@ class PleskMigrationOrchestrator:
         session_dir = self.sessions_dir / self.session_name
         migration_list = session_dir / "migration-list"
 
-        if migration_list.exists() and not self.force_regenerate:
-            raise PhaseExecutionError(
-                f"migration-list já existe em {migration_list}. "
-                "Use --force-regenerate para sobrescrever."
-            )
+        if migration_list.exists():
+            if self.resume:
+                ts = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                backup = migration_list.with_suffix(f".pre-resume.{ts}.bak")
+                if not self.dry_run:
+                    shutil.copy2(migration_list, backup)
+                self.logger.warning(
+                    "Resume: migration-list existente preservada "
+                    "(backup: %s). Pulando geração.", backup,
+                )
+                return migration_list
+            if not self.force_regenerate:
+                raise PhaseExecutionError(
+                    f"migration-list já existe em {migration_list}. "
+                    "Use --resume para retomar OU "
+                    "--force-regenerate para sobrescrever."
+                )
 
         if self.force_regenerate and migration_list.exists() and not self.dry_run:
             backup = migration_list.with_suffix(".pre-regenerate.bak")
@@ -1009,6 +1035,7 @@ class PleskMigrationOrchestrator:
         skip_web: bool = False,
         skip_mail: bool = False,
         skip_db: bool = False,
+        start_from: str | None = None,
     ) -> None:
         self.logger.info("Fase: transfer_accounts")
         self._require_plesk_migrator_bin()
@@ -1020,9 +1047,14 @@ class PleskMigrationOrchestrator:
             cmd.append("--skip-copy-mail-content")
         if skip_db:
             cmd.append("--skip-copy-db-content")
+        if start_from:
+            cmd.extend(["--start-from", start_from])
+            self.logger.info(
+                "transfer-accounts retomando a partir de step: %s",
+                start_from,
+            )
         # EXTEND: --migration-list-file <path>
         # EXTEND: --skip-services-checks
-        # EXTEND: --start-from <step>
         self._run(
             cmd,
             timeout=TIMEOUT_TRANSFER,
@@ -1090,6 +1122,52 @@ class PleskMigrationOrchestrator:
     # Pipeline (§9 spec)
     # ------------------------------------------------------------------
 
+    def _session_fingerprint_path(self) -> pathlib.Path:
+        return self.sessions_dir / self.session_name / ".orchestrator-fingerprint"
+
+    def _compute_config_fingerprint(self) -> str:
+        payload = json.dumps(
+            self.config, sort_keys=True, ensure_ascii=False, default=str
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _validate_resume_fingerprint(self) -> None:
+        fp_file = self._session_fingerprint_path()
+        current = self._compute_config_fingerprint()
+        if not fp_file.exists():
+            self.logger.warning(
+                "Resume sem fingerprint prévio em %s. "
+                "Sessão antiga (criada antes do suporte a --resume): "
+                "prosseguindo SEM validação de integridade do YAML. "
+                "Garante que o YAML não foi alterado desde a primeira execução.",
+                fp_file,
+            )
+            if not self.dry_run:
+                fp_file.parent.mkdir(parents=True, exist_ok=True)
+                fp_file.write_text(current)
+            return
+        saved = fp_file.read_text().strip()
+        if saved != current:
+            raise PhaseExecutionError(
+                f"Config YAML diverge do fingerprint da sessão ({fp_file}). "
+                f"Resume bloqueado: re-executar pode corromper estado parcial. "
+                f"Resolva: (a) restaure YAML para versão original, OU "
+                f"(b) descarte sessão "
+                f"(rm -rf {self.sessions_dir / self.session_name}) "
+                f"e refaça do zero."
+            )
+        self.logger.info("Resume: fingerprint do YAML confere (%s)", fp_file)
+
+    def _write_resume_fingerprint(self) -> None:
+        fp_file = self._session_fingerprint_path()
+        try:
+            fp_file.parent.mkdir(parents=True, exist_ok=True)
+            fp_file.write_text(self._compute_config_fingerprint())
+        except OSError as exc:
+            self.logger.debug(
+                "Não foi possível escrever fingerprint em %s: %s", fp_file, exc
+            )
+
     def run_all(
         self,
         *,
@@ -1098,6 +1176,7 @@ class PleskMigrationOrchestrator:
         skip_web_content: bool = False,
         skip_mail_content: bool = False,
         skip_db_content: bool = False,
+        start_from: str | None = None,
     ) -> None:
         behavior = self.config.get("behavior") or {}
         behavior_skip = behavior.get("skip") or {}
@@ -1112,6 +1191,12 @@ class PleskMigrationOrchestrator:
         skip_db_content = (
             skip_db_content or behavior_skip.get("db_content", False)
         )
+        start_from = start_from or self.start_from or behavior.get("start_from")
+
+        if self.resume:
+            self._validate_resume_fingerprint()
+        elif not self.dry_run:
+            self._write_resume_fingerprint()
 
         migration_cfg = self.config.get("migration") or {}
         has_filter = bool(
@@ -1139,6 +1224,7 @@ class PleskMigrationOrchestrator:
                  skip_web=skip_web_content,
                  skip_mail=skip_mail_content,
                  skip_db=skip_db_content,
+                 start_from=start_from,
              ),
              True),
             ("copy-web", self.copy_web_content, not skip_web_content),
@@ -1213,6 +1299,20 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Pula copy-mail-content + flag em transfer-accounts")
     parser.add_argument("--skip-db-content", action="store_true",
                         help="Pula copy-db-content + flag em transfer-accounts")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Retoma sessão existente: pula generate-migration-list se já "
+             "existir (backup automático), valida fingerprint do YAML. "
+             "Conflita com --force-regenerate.",
+    )
+    parser.add_argument(
+        "--start-from", metavar="STEP", default=None,
+        help="Passa --start-from <STEP> ao 'plesk-migrator transfer-accounts'. "
+             "Steps variam por versão; consulte "
+             "'plesk-migrator transfer-accounts --help'. "
+             "Comuns: copy-database, copy-web-content, copy-mail-content, "
+             "deploy-database, deploy-domain, restore-hosting.",
+    )
     return parser
 
 
@@ -1251,6 +1351,19 @@ def main(argv: list[str] | None = None) -> int:
     cleanup_config = (
         args.cleanup_config or behavior.get("cleanup_config", False)
     )
+    resume = args.resume or behavior.get("resume", False)
+    start_from = args.start_from or behavior.get("start_from")
+
+    if resume and force_regenerate:
+        sys.stderr.write(
+            "ERRO: --resume e --force-regenerate são mutuamente exclusivos\n"
+        )
+        return 1
+    if start_from and args.only_phase not in (None, "all", "transfer"):
+        sys.stderr.write(
+            "ERRO: --start-from requer --only-phase transfer (ou all/default)\n"
+        )
+        return 1
 
     try:
         orchestrator = PleskMigrationOrchestrator(
@@ -1259,6 +1372,8 @@ def main(argv: list[str] | None = None) -> int:
             force_regenerate=force_regenerate,
             cleanup_config=cleanup_config,
             verbose=args.verbose,
+            resume=resume,
+            start_from=start_from,
         )
     except ValidationError as exc:
         sys.stderr.write(f"ERRO de configuração: {exc}\n")
@@ -1271,6 +1386,7 @@ def main(argv: list[str] | None = None) -> int:
             skip_web_content=args.skip_web_content,
             skip_mail_content=args.skip_mail_content,
             skip_db_content=args.skip_db_content,
+            start_from=start_from,
         )
     except LockError as exc:
         sys.stderr.write(f"ERRO de lock: {exc}\n")
