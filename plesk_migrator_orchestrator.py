@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 
 try:
@@ -94,6 +95,7 @@ _READ_ONLY_COMMANDS = (
 )
 
 PHASES_ORDER = [
+    "sanity-check",
     "install",
     "config",
     "list",
@@ -655,6 +657,67 @@ class PleskMigrationOrchestrator:
     # Fases (§7 spec)
     # ------------------------------------------------------------------
 
+    def sanity_check(self) -> None:
+        """Auto-diagnóstico do ambiente antes de qualquer fase mutativa.
+
+        Roda como primeira fase do pipeline. Confirma que estamos num host
+        Plesk Obsidian operacional rodando como root. Aborta com mensagem
+        clara em vez de deixar o pipeline falhar fragmentado mais adiante.
+
+        Em dry-run: skip (`plesk version` exige binário real).
+        """
+        self.logger.info("Fase: sanity_check")
+        if self.dry_run:
+            self.logger.info(
+                "[DRY-RUN] sanity-check pulado — `plesk version` precisa "
+                "do binário real."
+            )
+            return
+
+        # 1. Privilégio: orchestrator escreve em /usr/local/psa/var/... e
+        # invoca `plesk installer` — exige root.
+        euid = os.geteuid() if hasattr(os, "geteuid") else -1
+        if euid != 0:
+            raise PreflightError(
+                f"Orchestrator precisa rodar como root (uid 0), atual={euid}. "
+                "Use `sudo ./run.sh --config /etc/plesk-migration.yaml`."
+            )
+
+        # 2. Auto-discovery resolveu o binário plesk?
+        if not self.plesk_bin:
+            raise PreflightError(
+                "Binário 'plesk' não localizado em locais conhecidos nem no "
+                f"$PATH. Procurei em: {', '.join(_PLESK_BIN_CANDIDATES)}. "
+                "Este host não parece ser um servidor Plesk Obsidian. "
+                "Sobrescreva paths.plesk_bin no YAML se o caminho for outro."
+            )
+
+        # 3. Plesk operacional e versão Obsidian (>= 18.x). `plesk version`
+        # imprime info do produto; aceitamos "obsidian" no output OU major
+        # version >= 18 (tolerante a variações de formatação).
+        result = self._run([str(self.plesk_bin), "version"], check=False)
+        if result.returncode != 0:
+            raise PreflightError(
+                f"`plesk version` retornou rc={result.returncode} — Plesk "
+                "não está respondendo. Verifique se o serviço está rodando."
+            )
+        output = result.stdout or ""
+        version_ok = "obsidian" in output.lower()
+        if not version_ok:
+            match = re.search(r"(\d+)\.\d+", output)
+            if match and int(match.group(1)) >= 18:
+                version_ok = True
+        if not version_ok:
+            raise PreflightError(
+                "Versão do Plesk não identificada como Obsidian (>= 18.x). "
+                f"Saída de `plesk version`:\n{output[:500]}"
+            )
+
+        self.logger.info(
+            "✓ sanity-check OK: rodando como root, plesk em %s, Obsidian 18.x+",
+            self.plesk_bin,
+        )
+
     def _require_runtime_state(self) -> None:
         """Aborta se config.ini/migration-list faltam (pré-req de fases pós-list).
 
@@ -771,31 +834,50 @@ class PleskMigrationOrchestrator:
                 "localizado após auto-discovery. Verifique o log de install."
             )
 
+        # Sanity pós-install: `plesk-migrator help` deve responder OK,
+        # confirmando que o binário não está corrompido ou faltando libs.
+        help_result = self._run(
+            [str(self.plesk_migrator_bin), "help"], check=False
+        )
+        if help_result.returncode != 0:
+            raise PreflightError(
+                f"plesk-migrator help retornou rc={help_result.returncode} "
+                "após install — install pode estar corrompido. Recomendado "
+                "reinstalar via `plesk installer --reinstall-patch "
+                "--install-component panel-migrator`."
+            )
+        self.logger.info("✓ plesk-migrator operacional (help rc=0)")
+
     def generate_config_ini(self) -> pathlib.Path:
         self.logger.info("Fase: generate_config_ini")
         src = self.config["source"]
         dst = self.config["dest"]
 
+        # `source-servers` em [GLOBAL] aponta para o NOME da seção que descreve
+        # cada servidor de origem (docs Plesk). Mantemos o link explícito numa
+        # variável para que renomear a seção não exija atualizar dois lugares.
+        SOURCE_SECTION = "cpanel"
+
         cfg = configparser.ConfigParser()
         cfg["GLOBAL"] = {
             "source-type": "cpanel",
-            "source-servers": "cpanel",
+            "source-servers": SOURCE_SECTION,
             "target-type": "plesk",
         }
         cfg["plesk"] = {
             "ip": dst["host"],
             "os": "unix",
         }
-        cpanel_section = {
+        source_server = {
             "ip": src["host"],
             "os": "unix",
             "ssh-password": src["ssh_password"],
         }
         if int(src.get("ssh_port", 22)) != 22:
-            cpanel_section["ssh-port"] = str(src["ssh_port"])
+            source_server["ssh-port"] = str(src["ssh_port"])
         if src.get("postgres_password"):
-            cpanel_section["postgres-password"] = src["postgres_password"]
-        cfg["cpanel"] = cpanel_section
+            source_server["postgres-password"] = src["postgres_password"]
+        cfg[SOURCE_SECTION] = source_server
 
         config_path = self.conf_dir / "config.ini"
 
@@ -1036,10 +1118,12 @@ class PleskMigrationOrchestrator:
             migration_cfg.get("allowlist") or migration_cfg.get("denylist")
         )
 
-        # Ordem: preflight roda DEPOIS de list/filter porque
-        # `plesk-migrator check` valida a migration-list atual e deve ser
-        # re-executado sempre que ela mudar (docs Plesk CLI guide).
-        phases: list[tuple[str, callable, bool]] = [
+        # Ordem: sanity-check primeiro (aborta cedo se não-Plesk ou não-root);
+        # preflight roda DEPOIS de list/filter porque `plesk-migrator check`
+        # valida a migration-list atual e deve ser re-executado sempre que
+        # ela mudar (docs Plesk CLI guide).
+        phases: list[tuple[str, Callable[[], None], bool]] = [
+            ("sanity-check", self.sanity_check, True),
             ("install", self.ensure_plesk_migrator_installed, not skip_install),
             ("config", self.generate_config_ini, True),
             ("list", self.generate_migration_list, True),

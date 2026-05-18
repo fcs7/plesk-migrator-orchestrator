@@ -142,6 +142,7 @@ sudo ./run.sh --config /etc/plesk-migration.yaml
 ### Fases isoladas
 
 ```bash
+sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase sanity-check
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase install
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase config
 sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase list
@@ -175,17 +176,18 @@ Flags CLI sempre sobrescrevem o bloco `behavior.*` do YAML.
 
 | # | Fase | O que faz |
 |---|------|-----------|
-| 1 | `install` | Detecta `panel-migrator` via `extension --list`; se ausente, instala via `plesk installer --select-release-current --install-component panel-migrator` |
-| 2 | `config` | Gera `config.ini` em `conf_dir/` com seções `[GLOBAL]`/`[plesk]`/`[cpanel]` (chmod 600) |
-| 3 | `list` | Roda `generate-migration-list`; aborta se já existe (use `--force-regenerate`) |
-| 4 | `filter` | **Desabilitada** nesta versão (no-op). Ver [Filtragem de migration-list](#filtragem-de-migration-list) |
-| 5 | `preflight` | Roda `plesk-migrator check` (valida SSH, espaço, versão da origem etc.). Pulado em `--dry-run` |
-| 6 | `transfer` | Roda `transfer-accounts` (com flags `--skip-copy-*-content` opcionais) |
-| 7 | `copy-web` | Roda `copy-web-content` para re-sincronizar arquivos web |
-| 8 | `copy-mail` | Roda `copy-mail-content` para re-sincronizar mailboxes |
-| 9 | `copy-db` | Roda `copy-db-content` para re-sincronizar bancos |
-| 10 | `test` | Roda `test-all` para validar o resultado |
-| 11 | `cleanup-config` | Apaga `config.ini` se `--cleanup-config` (default: pula). **NÃO** invoca subcomando do `plesk-migrator` — só remove a senha do disco |
+| 1 | `sanity-check` | Auto-diagnóstico do ambiente: confirma root, `plesk` binary localizado, e `plesk version` retorna Obsidian 18.x+. Aborta cedo se não bate. Pulado em `--dry-run`. |
+| 2 | `install` | Detecta `panel-migrator` via `extension --list`; se ausente, instala via `plesk installer --select-release-current --install-component panel-migrator`. Após install, valida com `plesk-migrator help`. |
+| 3 | `config` | Gera `config.ini` em `conf_dir/` com seções `[GLOBAL]`/`[plesk]`/`[cpanel]` (chmod 600) |
+| 4 | `list` | Roda `generate-migration-list`; aborta se já existe (use `--force-regenerate`); aborta se a lista sair vazia |
+| 5 | `filter` | **Desabilitada** nesta versão (no-op). Ver [Filtragem de migration-list](#filtragem-de-migration-list) |
+| 6 | `preflight` | Roda `plesk-migrator check` (valida SSH, espaço, versão da origem etc.). Pulado em `--dry-run` |
+| 7 | `transfer` | Roda `transfer-accounts` (com flags `--skip-copy-*-content` opcionais) |
+| 8 | `copy-web` | Roda `copy-web-content` para re-sincronizar arquivos web |
+| 9 | `copy-mail` | Roda `copy-mail-content` para re-sincronizar mailboxes |
+| 10 | `copy-db` | Roda `copy-db-content` para re-sincronizar bancos |
+| 11 | `test` | Roda `test-all` para validar o resultado |
+| 12 | `cleanup-config` | Apaga `config.ini` se `--cleanup-config` (default: pula). **NÃO** invoca subcomando do `plesk-migrator` — só remove a senha do disco |
 
 Cada fase tem timeout configurado (10 min para install, 4 h para transfer e
 cada `copy-*`, 1 h para `generate-list`, 30 min para `check`, 2 h para `test`).
