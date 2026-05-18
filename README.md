@@ -70,7 +70,16 @@ sudo ./run.sh --config /etc/plesk-migration.yaml --dry-run --skip-install
 ```
 
 Loga cada comando que seria executado e o conteúdo do `config.ini` que seria
-escrito (com senhas mascaradas como `***`). Não toca filesystem do Plesk.
+escrito (com senhas mascaradas como `***`). Em dry-run:
+
+- `config.ini` e `migration-list` **não** são escritos no disco.
+- `plesk-migrator check` (preflight) é **pulado** — depende de estado real
+  que dry-run não gera, então rodar contra estado obsoleto seria enganoso.
+- Apenas leituras inofensivas (`plesk extension --list`, `plesk-migrator help`)
+  rodam de verdade — usadas para auto-discovery e detecção da extensão.
+
+Para preflight real, rode `--only-phase preflight` (sem `--dry-run`) após
+o pipeline já ter gerado config + migration-list.
 
 ### Pipeline completo
 
@@ -117,8 +126,8 @@ Flags CLI sempre sobrescrevem o bloco `behavior.*` do YAML.
 | 1 | `install` | Detecta `panel-migrator` via `extension --list`; se ausente, instala via `plesk installer --select-release-current --install-component panel-migrator` |
 | 2 | `config` | Gera `config.ini` em `conf_dir/` com seções `[GLOBAL]`/`[plesk]`/`[cpanel]` (chmod 600) |
 | 3 | `list` | Roda `generate-migration-list`; aborta se já existe (use `--force-regenerate`) |
-| 4 | `filter` | Aplica allowlist/denylist em `migration-list` (cria `.bak`); pula se ambas vazias |
-| 5 | `preflight` | Roda `plesk-migrator check` (valida SSH, espaço, versão da origem etc.). Roda após `filter` porque o check deve refletir a migration-list final |
+| 4 | `filter` | **Desabilitada** nesta versão (no-op). Ver [Filtragem de migration-list](#filtragem-de-migration-list) |
+| 5 | `preflight` | Roda `plesk-migrator check` (valida SSH, espaço, versão da origem etc.). Pulado em `--dry-run` |
 | 6 | `transfer` | Roda `transfer-accounts` (com flags `--skip-copy-*-content` opcionais) |
 | 7 | `copy-web` | Roda `copy-web-content` para re-sincronizar arquivos web |
 | 8 | `copy-mail` | Roda `copy-mail-content` para re-sincronizar mailboxes |
@@ -158,12 +167,48 @@ tail -f /var/log/plesk-migration-orchestrator/transfer-accounts.log
 tail -f /var/log/plesk-migration-orchestrator/copy-web.log
 ```
 
-### Restaurar migration-list filtrada
+### Filtragem de migration-list
 
-```bash
-mv /usr/local/psa/var/modules/panel-migrator/sessions/migration-session/migration-list.bak \
-   /usr/local/psa/var/modules/panel-migrator/sessions/migration-session/migration-list
+Filtragem local via `migration.allowlist` / `migration.denylist` está
+**desabilitada** nesta versão. O arquivo `migration-list` gerado pelo Plesk
+Migrator contém objetos estruturados (resellers, customers, plans, domínios)
+e um filtro ingênuo por linha corrompe a hierarquia. Se `allowlist` ou
+`denylist` no YAML não estiverem vazios, a validação aborta antes do
+pipeline rodar.
+
+Alternativas para limitar escopo:
+
+1. **Edição manual** entre fases:
+   ```bash
+   sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase list
+   sudo $EDITOR /usr/local/psa/var/modules/panel-migrator/sessions/migration-session/migration-list
+   sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase preflight
+   sudo ./run.sh --config /etc/plesk-migration.yaml --only-phase transfer
+   # … etc
+   ```
+2. **Flag nativa** `--migration-list-file <path>` do `plesk-migrator`
+   (não exposta ainda — ver `# EXTEND:` no código).
+
+### Auto-discovery de caminhos
+
+O orquestrador procura os binários do Plesk em locais canônicos antes de
+qualquer fase: `/usr/local/psa/bin/`, `/opt/psa/bin/`, `/usr/sbin/` e
+`$PATH`. O log no início mostra exatamente o que foi resolvido:
+
 ```
+[INFO] Auto-discovery de caminhos:
+[INFO]   plesk:           /usr/local/psa/bin/plesk
+[INFO]   extension:       /usr/local/psa/bin/extension
+[INFO]   plesk-migrator:  /usr/local/psa/admin/sbin/modules/panel-migrator/plesk-migrator
+[INFO]   conf_dir:        /usr/local/psa/var/modules/panel-migrator/conf
+[INFO]   sessions_dir:    /usr/local/psa/var/modules/panel-migrator/sessions
+```
+
+Se algum aparecer como `(não encontrado)`, edite o YAML para apontar
+manualmente (`paths.plesk_bin`, `paths.plesk_extension_bin`,
+`paths.plesk_migrator_bin`). `conf_dir`, `sessions_dir` e `session_name`
+**não** podem ser sobrescritos — o `plesk-migrator` lê/escreve nesses
+paths fixos e qualquer override criaria mismatch silencioso.
 
 ### Flags avançadas do Plesk Migrator
 
