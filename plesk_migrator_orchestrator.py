@@ -94,6 +94,11 @@ TIMEOUT_FTP_AUDIT = 60         # 1 min — leitura de accounts_report_tree
 TIMEOUT_SANITIZE_LIST = 60     # 1 min — regex em migration-list
 TIMEOUT_FIX_OWNER = 1800       # 30 min — cria customer + reassign subscription
 
+# Subpastas escaneadas por fix-docroot dentro de /var/www/vhosts/<domain>/.
+# Ordem importa apenas para tie-break determinístico (mesmo total_bytes):
+# httpdocs primeiro porque é o canonical Plesk; se rivaliza com outro, vence.
+DOCROOT_CANDIDATES = ("httpdocs", "public_html", "www", "web")
+
 # Subdomains reservados pelo Plesk (primeiro label do FQDN). Aplicação cPanel
 # que use esses nomes precisa rename — sanitize-list propõe alternativas.
 RESERVED_PLESK_SUBDOMAINS = (
@@ -1667,6 +1672,41 @@ class PleskMigrationOrchestrator:
                     total += st.st_size
         digest = hashlib.md5("\n".join(entries).encode("utf-8")).hexdigest()
         return count, total, digest
+
+    @staticmethod
+    def _pick_docroot(
+        manifests: dict[str, tuple[int, int, str]],
+    ) -> str | None:
+        """Decide which candidate `<vhost>/<name>` should be www-root.
+
+        Input: {candidate_name: (file_count, total_bytes, manifest_hash)}.
+        Returns the candidate name to point www-root at, or None when no
+        action is needed:
+          - all candidates empty
+          - httpdocs already has content (canonical wins, even if another
+            candidate also has content — we don't move a working site)
+          - the richest non-canonical candidate has the same manifest_hash
+            as httpdocs (symlinked / hardlinked / prior partial fix)
+
+        Tie-break on total_bytes picks the first key in insertion order,
+        which matches DOCROOT_CANDIDATES ordering."""
+        httpdocs = manifests.get("httpdocs", (0, 0, ""))
+        rich = {k: v for k, v in manifests.items() if v[0] > 0}
+        if not rich:
+            return None
+        if httpdocs[0] > 0:
+            return None
+        # httpdocs is empty; pick the heaviest non-httpdocs candidate
+        best_name = max(
+            (k for k in rich if k != "httpdocs"),
+            key=lambda k: rich[k][1],
+            default=None,
+        )
+        if best_name is None:
+            return None
+        if rich[best_name][2] == httpdocs[2]:
+            return None
+        return best_name
 
     def fix_docroot(self) -> None:
         """Ajusta www-root das subscriptions migradas quando plesk-migrator
