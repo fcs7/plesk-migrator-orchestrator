@@ -77,7 +77,9 @@ behavior:
     fix_mail_quota: false       # --skip-fix-mail-quota
     fix_ftp_renames: false      # --skip-fix-ftp-renames
     fix_dns_conflicts: false    # --skip-fix-dns-conflicts
+    fix_owner: false            # --skip-fix-owner
   # Opt-ins (default OFF — efeito sobre estado/cliente)
+  apply_owner_fix: false             # --apply-owner-fix (cria customers + reassign subscriptions)
   rename_reserved_subdomains: false  # --rename-reserved-subdomains
   apply_dns_cleanup: false           # --apply-dns-cleanup
   apply_mailpath_fix: false          # --apply-mailpath-fix

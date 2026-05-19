@@ -361,11 +361,21 @@ class PleskMigrationOrchestrator:
 
         behavior = cfg.get("behavior") or {}
         skip = behavior.get("skip") or {}
-        for key in ("web_content", "mail_content", "db_content"):
+        for key in (
+            "web_content", "mail_content", "db_content",
+            "fix_docroot", "fix_mailpath", "check_mail_passwords",
+            "sanitize_list", "fix_limits", "retransfer_failed",
+            "fix_mail_quota", "fix_ftp_renames", "fix_dns_conflicts",
+            "fix_owner",
+        ):
             if key in skip and not isinstance(skip[key], bool):
                 raise ValidationError(f"behavior.skip.{key} deve ser bool")
-        for key in ("dry_run", "skip_install", "force_regenerate",
-                    "cleanup_config", "resume"):
+        for key in (
+            "dry_run", "skip_install", "force_regenerate",
+            "cleanup_config", "resume",
+            "apply_owner_fix", "apply_dns_cleanup", "apply_mailpath_fix",
+            "reset_mail_passwords", "rename_reserved_subdomains",
+        ):
             if key in behavior and not isinstance(behavior[key], bool):
                 raise ValidationError(f"behavior.{key} deve ser bool")
         if "start_from" in behavior and behavior["start_from"] is not None:
@@ -2136,7 +2146,7 @@ class PleskMigrationOrchestrator:
         indica dono cPanel. Audit default lista mismatches em
         <log_dir>/owner-mismatches.csv. Com apply=True cria customer
         ausente (login slugificado, senha urlsafe(16)) e reassigna via
-        `plesk bin subscription -u <dom> -owner <login>`. Senhas em
+        `plesk bin subscription --change-owner <dom> -owner <login>`. Senhas em
         <log_dir>/owner-fix.csv chmod 600 — distribua fora-de-banda."""
         self.logger.info("Fase: fix_owner (apply=%s)", apply)
         if not self.plesk_bin:
@@ -2279,9 +2289,10 @@ class PleskMigrationOrchestrator:
                     try:
                         self._run(
                             [str(self.plesk_bin), "bin", "customer",
-                             "--create", login, "-passwd", password,
-                             "-cname", cust, "-email", email,
-                             "-status", "active"],
+                             "--create", login,
+                             "-name", cust,
+                             "-passwd", password,
+                             "-email", email],
                             timeout=TIMEOUT_FIX_OWNER,
                             log_to=self.log_dir / "fix-owner.log",
                         )
@@ -2299,7 +2310,7 @@ class PleskMigrationOrchestrator:
                     try:
                         self._run(
                             [str(self.plesk_bin), "bin", "subscription",
-                             "-u", dom, "-owner", login],
+                             "--change-owner", dom, "-owner", login],
                             timeout=120,
                             log_to=self.log_dir / "fix-owner.log",
                         )
@@ -2982,7 +2993,7 @@ def _build_parser() -> argparse.ArgumentParser:
                              "(login slugificado, senha urlsafe(16) em "
                              "<log_dir>/owner-fix.csv chmod 600) e "
                              "reassigna subscription via "
-                             "`plesk bin subscription -u <dom> -owner <login>`. "
+                             "`plesk bin subscription --change-owner <dom> -owner <login>`. "
                              "Distribua senhas via canal seguro fora-de-banda.")
     parser.add_argument(
         "--resume", action="store_true",
