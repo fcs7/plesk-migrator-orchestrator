@@ -1556,6 +1556,45 @@ class PleskMigrationOrchestrator:
 
         self.logger.info("fix_limits: %d subscription(s) atualizada(s)", updated)
 
+    @staticmethod
+    def _parse_reserved_subdomain_failures(
+        session_dir: pathlib.Path,
+    ) -> set[str]:
+        """Parse the newest accounts_report_tree.* in `session_dir` and return
+        the set of first-label segments of subdomains that plesk-migrator
+        failed to create with the message:
+          "sites of subscription were not created - they do not exist on
+           target panel: '<host>'"
+        Returns the set of `host.split('.', 1)[0]` for every match (e.g.
+        {"webmail"} when webmail.example.com failed).
+
+        Missing session dir, no matching report, and unreadable files all
+        yield set(). Filenames sorted lexicographically — the timestamped
+        suffix is wide enough to keep that aligned with chronological order
+        for plesk-migrator output."""
+        if not session_dir.is_dir():
+            return set()
+        candidates = sorted(
+            p for p in session_dir.glob("accounts_report_tree.*")
+            if p.is_file() and ".json" not in p.suffixes
+        )
+        if not candidates:
+            return set()
+        latest = candidates[-1]
+        try:
+            text = latest.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return set()
+        pattern = re.compile(
+            r"sites of subscription were not created[^:]*:\s+'([^']+)'"
+        )
+        labels: set[str] = set()
+        for host in pattern.findall(text):
+            first = host.split(".", 1)[0].lower()
+            if first:
+                labels.add(first)
+        return labels
+
     def retransfer_failed(
         self, *, max_attempts: int = MAX_RETRANSFER_ATTEMPTS,
     ) -> None:
