@@ -1613,6 +1613,31 @@ class PleskMigrationOrchestrator:
             return False
         return out.strip() == "1"
 
+    def _subscription_only_reserved_failures(
+        self, domain: str, session_dir: pathlib.Path,
+    ) -> bool:
+        """Classify a `failed-subscriptions` entry as recoverable.
+
+        Returns True iff:
+          1. The newest accounts_report_tree.* contains at least one
+             "sites of subscription were not created" failure.
+          2. ALL such failures are first-label members of
+             RESERVED_PLESK_SUBDOMAINS (webmail, mail, ftp, ...).
+          3. `domain` already exists in psa.domains (subscription was
+             created by plesk-migrator before the reserved subdomain hit
+             the wall — so we have working hosting, just not the blocked
+             subdomain that Plesk would refuse anyway).
+
+        Used by retransfer_failed to skip retrying domains that will never
+        succeed (Plesk reserves these subdomain names) but whose parent
+        subscription is already operational."""
+        labels = self._parse_reserved_subdomain_failures(session_dir)
+        if not labels:
+            return False
+        if not labels.issubset(set(RESERVED_PLESK_SUBDOMAINS)):
+            return False
+        return self._domain_exists_in_plesk(domain)
+
     def retransfer_failed(
         self, *, max_attempts: int = MAX_RETRANSFER_ATTEMPTS,
     ) -> None:

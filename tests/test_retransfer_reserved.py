@@ -130,5 +130,88 @@ class DomainExistsInPleskTests(unittest.TestCase):
         self.assertIn("a\\'b.com", sql)
 
 
+class SubscriptionOnlyReservedFailuresTests(unittest.TestCase):
+    def _make_orch(self) -> PleskMigrationOrchestrator:
+        orch = PleskMigrationOrchestrator.__new__(PleskMigrationOrchestrator)
+        orch.dry_run = False
+        orch.logger = mock.MagicMock()
+        orch.plesk_bin = pathlib.Path("/usr/sbin/plesk")
+        return orch
+
+    def test_true_when_only_reserved_labels_and_domain_exists(self) -> None:
+        orch = self._make_orch()
+        orch._domain_exists_in_plesk = mock.MagicMock(return_value=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp)
+            (session / "accounts_report_tree.2026.05.19.14.27.47").write_text(
+                "sites of subscription were not created - they do not exist"
+                " on target panel: 'webmail.opiniao.inf.br'\n"
+            )
+            self.assertTrue(
+                orch._subscription_only_reserved_failures(
+                    "opiniao.inf.br", session
+                )
+            )
+
+    def test_false_when_label_not_reserved(self) -> None:
+        orch = self._make_orch()
+        orch._domain_exists_in_plesk = mock.MagicMock(return_value=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp)
+            (session / "accounts_report_tree.2026.05.19.14.27.47").write_text(
+                "sites of subscription were not created - they do not exist"
+                " on target panel: 'random-subdomain.opiniao.inf.br'\n"
+            )
+            self.assertFalse(
+                orch._subscription_only_reserved_failures(
+                    "opiniao.inf.br", session
+                )
+            )
+
+    def test_false_when_domain_missing(self) -> None:
+        orch = self._make_orch()
+        orch._domain_exists_in_plesk = mock.MagicMock(return_value=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp)
+            (session / "accounts_report_tree.2026.05.19.14.27.47").write_text(
+                "sites of subscription were not created - they do not exist"
+                " on target panel: 'webmail.opiniao.inf.br'\n"
+            )
+            self.assertFalse(
+                orch._subscription_only_reserved_failures(
+                    "opiniao.inf.br", session
+                )
+            )
+
+    def test_false_when_no_failures_parsed(self) -> None:
+        orch = self._make_orch()
+        orch._domain_exists_in_plesk = mock.MagicMock(return_value=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp)
+            (session / "accounts_report_tree.2026.05.19.14.27.47").write_text(
+                "Detailed Migration Status\n"
+            )
+            self.assertFalse(
+                orch._subscription_only_reserved_failures(
+                    "opiniao.inf.br", session
+                )
+            )
+
+    def test_true_when_mixed_reserved_labels(self) -> None:
+        orch = self._make_orch()
+        orch._domain_exists_in_plesk = mock.MagicMock(return_value=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp)
+            (session / "accounts_report_tree.2026.05.19.14.27.47").write_text(
+                "sites of subscription were not created - they do not exist"
+                " on target panel: 'webmail.x.com'\n"
+                "sites of subscription were not created - they do not exist"
+                " on target panel: 'mail.x.com'\n"
+            )
+            self.assertTrue(
+                orch._subscription_only_reserved_failures("x.com", session)
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
