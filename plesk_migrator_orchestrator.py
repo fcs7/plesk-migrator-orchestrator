@@ -1709,16 +1709,20 @@ class PleskMigrationOrchestrator:
         return best_name
 
     def fix_docroot(self) -> None:
-        """Ajusta www-root das subscriptions migradas quando plesk-migrator
-        depositou conteúdo em `public_html/` (layout cPanel preservado) mas a
-        subscription Plesk continua apontando para `httpdocs/` (default vazio).
+        """Ajusta www-root das subscriptions migradas detectando onde
+        plesk-migrator depositou o conteúdo. Escaneia DOCROOT_CANDIDATES
+        em /var/www/vhosts/<domain>/, gera manifest stat-only por path
+        (count + bytes + md5 de filename:size), e via _pick_docroot
+        decide se ajusta.
 
         Idempotente:
-          - skip se vhost ausente
-          - skip se public_html vazio (nada a apontar)
-          - skip se httpdocs já populado (não-vazio = docroot ok ou usuário
-            já corrigiu)
-        """
+          - httpdocs já populado → skip
+          - tudo vazio → skip (vhost ainda não recebeu conteúdo)
+          - melhor candidato hash-igual a httpdocs (symlink/hardlink) → skip
+          - caso contrário → `plesk bin subscription -u <dom> -www-root <path>`
+
+        Log detalhado em <log_dir>/fix-docroot.log: por domínio, todos os
+        candidatos escaneados (count/bytes/hash truncado) + decisão."""
         self.logger.info("Fase: fix_docroot")
         if not self.plesk_bin:
             raise PhaseExecutionError(
@@ -1734,62 +1738,67 @@ class PleskMigrationOrchestrator:
             )
             return
 
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.logger.warning("fix_docroot: log_dir mkdir falhou: %s", exc)
+        report = self.log_dir / "fix-docroot.log"
+
         vhosts_root = pathlib.Path("/var/www/vhosts")
         for domain in domains:
             vhost = vhosts_root / domain
-            httpdocs = vhost / "httpdocs"
-            public_html = vhost / "public_html"
-
             if not vhost.is_dir():
                 self.logger.warning(
                     "fix_docroot: vhost %s ausente — skip", vhost
                 )
                 continue
-            if not public_html.is_dir():
-                self.logger.info(
-                    "fix_docroot: %s sem public_html — skip", domain
-                )
-                continue
+
+            manifests: dict[str, tuple[int, int, str]] = {}
+            for name in DOCROOT_CANDIDATES:
+                manifests[name] = self._dir_manifest(vhost / name)
+
+            scan_summary = ", ".join(
+                f"{n}={c}f/{b}B/{h[:8]}"
+                for n, (c, b, h) in manifests.items()
+            )
+            self.logger.info("fix_docroot: %s scan: %s", domain, scan_summary)
+
             try:
-                ph_has_content = any(public_html.iterdir())
+                with report.open("a", encoding="utf-8") as fh:
+                    ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                    fh.write(f"# {ts} {domain}\n")
+                    for n, (c, b, h) in manifests.items():
+                        fh.write(f"  {n}: count={c} bytes={b} hash={h}\n")
             except OSError as exc:
                 self.logger.warning(
-                    "fix_docroot: erro lendo %s: %s — skip", public_html, exc
+                    "fix_docroot: falha escrevendo report: %s", exc
                 )
-                continue
-            if not ph_has_content:
+
+            choice = self._pick_docroot(manifests)
+            if choice is None:
                 self.logger.info(
-                    "fix_docroot: %s public_html vazio — skip", domain
-                )
-                continue
-            try:
-                ht_has_content = httpdocs.is_dir() and any(httpdocs.iterdir())
-            except OSError as exc:
-                self.logger.warning(
-                    "fix_docroot: erro lendo %s: %s — skip", httpdocs, exc
-                )
-                continue
-            if ht_has_content:
-                self.logger.info(
-                    "fix_docroot: %s httpdocs já populado — skip", domain
+                    "fix_docroot: %s nada a ajustar — skip", domain
                 )
                 continue
 
+            target = vhost / choice
             self.logger.info(
-                "fix_docroot: ajustando www-root de %s → %s", domain, public_html
+                "fix_docroot: %s → apontando www-root para %s "
+                "(%d arquivos, %d bytes)",
+                domain, target, manifests[choice][0], manifests[choice][1],
             )
             if self.dry_run:
                 self.logger.info(
                     "[DRY-RUN] %s bin subscription -u %s -www-root %s",
-                    self.plesk_bin, domain, public_html,
+                    self.plesk_bin, domain, target,
                 )
                 continue
 
             self._run(
                 [str(self.plesk_bin), "bin", "subscription",
-                 "-u", domain, "-www-root", str(public_html)],
+                 "-u", domain, "-www-root", str(target)],
                 timeout=TIMEOUT_FIX_DOCROOT,
-                log_to=self.log_dir / "fix-docroot.log",
+                log_to=report,
             )
 
     def fix_mailpath(self, *, apply: bool = False) -> None:
