@@ -26,6 +26,62 @@ class DirManifestTests(unittest.TestCase):
             self.assertEqual(total, 0)
             self.assertEqual(digest, hashlib.md5(b"").hexdigest())
 
+    def test_populated_directory_counts_files_and_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "index.html").write_text("hello")          # 5 bytes
+            (root / "sub").mkdir()
+            (root / "sub" / "a.txt").write_text("xy")          # 2 bytes
+            (root / "sub" / "b.txt").write_bytes(b"\x00" * 10) # 10 bytes
+
+            count, total, digest = PleskMigrationOrchestrator._dir_manifest(root)
+
+            self.assertEqual(count, 3)
+            self.assertEqual(total, 17)
+            self.assertNotEqual(digest, hashlib.md5(b"").hexdigest())
+
+    def test_identical_trees_have_identical_manifest_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            a = root / "a"
+            b = root / "b"
+            for d in (a, b):
+                d.mkdir()
+                (d / "index.php").write_text("<?php echo 1;")  # 14 bytes
+                (d / "wp-config.php").write_text("XXXXX")      # 5 bytes
+
+            _, _, digest_a = PleskMigrationOrchestrator._dir_manifest(a)
+            _, _, digest_b = PleskMigrationOrchestrator._dir_manifest(b)
+            self.assertEqual(digest_a, digest_b)
+
+    def test_different_size_breaks_manifest_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            a = root / "a"
+            b = root / "b"
+            a.mkdir(); b.mkdir()
+            (a / "f.txt").write_text("hello")
+            (b / "f.txt").write_text("helloworld")  # different size
+
+            _, _, digest_a = PleskMigrationOrchestrator._dir_manifest(a)
+            _, _, digest_b = PleskMigrationOrchestrator._dir_manifest(b)
+            self.assertNotEqual(digest_a, digest_b)
+
+    def test_missing_path_returns_zero(self) -> None:
+        nonexistent = pathlib.Path("/nonexistent/path/that/does/not/exist/xyz")
+        count, total, digest = PleskMigrationOrchestrator._dir_manifest(nonexistent)
+        self.assertEqual(count, 0)
+        self.assertEqual(total, 0)
+        self.assertEqual(digest, hashlib.md5(b"").hexdigest())
+
+    def test_file_path_not_dir_returns_zero(self) -> None:
+        with tempfile.NamedTemporaryFile() as tmp:
+            count, total, digest = PleskMigrationOrchestrator._dir_manifest(
+                pathlib.Path(tmp.name)
+            )
+            self.assertEqual(count, 0)
+            self.assertEqual(total, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
