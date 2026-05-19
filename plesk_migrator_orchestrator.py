@@ -22,6 +22,7 @@ import os
 import pathlib
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1802,6 +1803,98 @@ class PleskMigrationOrchestrator:
                     count += 1
                     total += st.st_size
         digest = hashlib.md5("\n".join(entries).encode("utf-8")).hexdigest()
+        return count, total, digest
+
+    def _remote_dir_manifest(
+        self, remote_path: str,
+    ) -> tuple[int, int, str]:
+        """Cross-server analogue of _dir_manifest.
+
+        Runs over SSH on the cPanel source host (host/port/password from
+        self.config["source"]). Pipeline:
+
+          find <path> -type f -printf '%P:%s\n' | sort -u > /tmp/m.$$
+          COUNT=$(wc -l < /tmp/m.$$)
+          TOTAL=$(awk -F: '{s+=$NF} END{print s+0}' /tmp/m.$$)
+          MD5=$(md5sum /tmp/m.$$ | awk '{print $1}')
+          # but md5sum hashes the file bytes — we want md5 over the
+          # joined-by-newlines body, identical to _dir_manifest. So we
+          # hash the file directly: md5sum < /tmp/m.$$ → that's the same
+          # because each entry is one line "p:s\n", joined by newlines.
+          # However _dir_manifest uses "\n".join (NO trailing \n). To
+          # match, strip the trailing newline server-side before md5sum.
+
+        Output format:
+          COUNT=<n>\nTOTAL=<b>\nMD5=<hex>\n
+
+        Returns (0, 0, "") on any failure (ssh missing, sshpass missing,
+        non-zero rc, malformed output, dry_run). Never raises — caller
+        treats divergence as a warning only."""
+        if self.dry_run:
+            return 0, 0, ""
+        src = self.config.get("source") or {}
+        host = src.get("host")
+        password = src.get("ssh_password")
+        port = int(src.get("ssh_port", 22))
+        if not host or not password:
+            return 0, 0, ""
+        # Shell pipeline. `printf '%s' "$body"` strips the trailing newline
+        # so md5 matches _dir_manifest's "\n".join semantics exactly.
+        remote_cmd = (
+            f"set -e; "
+            f"body=$(find {shlex.quote(remote_path)} -type f "
+            f"-printf '%P:%s\\n' 2>/dev/null | sort -u); "
+            f"count=$(printf '%s\\n' \"$body\" | grep -c '^' || true); "
+            f"if [ -z \"$body\" ]; then count=0; fi; "
+            f"total=$(printf '%s\\n' \"$body\" | awk -F: '{{s+=$NF}} "
+            f"END{{print s+0}}'); "
+            f"md5=$(printf '%s' \"$body\" | md5sum | awk '{{print $1}}'); "
+            f"echo \"COUNT=$count\"; echo \"TOTAL=$total\"; echo \"MD5=$md5\""
+        )
+        argv = [
+            "sshpass", "-p", str(password),
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=15",
+            "-o", "BatchMode=no",
+            "-p", str(port),
+            f"root@{host}",
+            remote_cmd,
+        ]
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True,
+                timeout=180, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.logger.warning(
+                "_remote_dir_manifest: ssh falhou: %s", exc,
+            )
+            return 0, 0, ""
+        if proc.returncode != 0:
+            self.logger.warning(
+                "_remote_dir_manifest: rc=%d stderr=%s",
+                proc.returncode, proc.stderr.strip()[:200],
+            )
+            return 0, 0, ""
+        count = total = 0
+        digest = ""
+        for line in proc.stdout.splitlines():
+            if line.startswith("COUNT="):
+                try:
+                    count = int(line.split("=", 1)[1])
+                except ValueError:
+                    return 0, 0, ""
+            elif line.startswith("TOTAL="):
+                try:
+                    total = int(line.split("=", 1)[1])
+                except ValueError:
+                    return 0, 0, ""
+            elif line.startswith("MD5="):
+                digest = line.split("=", 1)[1].strip()
+        if not digest:
+            return 0, 0, ""
         return count, total, digest
 
     @staticmethod
