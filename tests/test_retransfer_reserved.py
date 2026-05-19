@@ -81,5 +81,54 @@ class ParseReservedSubdomainFailuresTests(unittest.TestCase):
             self.assertEqual(labels, set())
 
 
+class DomainExistsInPleskTests(unittest.TestCase):
+    def _make_orch(self) -> PleskMigrationOrchestrator:
+        # Build minimal orchestrator via __new__ to bypass __init__ — we only
+        # need the methods that touch dry_run, logger, and _run_plesk_db.
+        orch = PleskMigrationOrchestrator.__new__(PleskMigrationOrchestrator)
+        orch.dry_run = False
+        orch.logger = mock.MagicMock()
+        orch.plesk_bin = pathlib.Path("/usr/sbin/plesk")
+        return orch
+
+    def test_returns_true_when_count_is_one(self) -> None:
+        orch = self._make_orch()
+        orch._run_plesk_db = mock.MagicMock(return_value="1\n")
+        self.assertTrue(orch._domain_exists_in_plesk("opiniao.inf.br"))
+        orch._run_plesk_db.assert_called_once()
+        sql = orch._run_plesk_db.call_args[0][0]
+        self.assertIn("opiniao.inf.br", sql)
+        self.assertIn("SELECT COUNT", sql)
+
+    def test_returns_false_when_count_is_zero(self) -> None:
+        orch = self._make_orch()
+        orch._run_plesk_db = mock.MagicMock(return_value="0\n")
+        self.assertFalse(orch._domain_exists_in_plesk("missing.com"))
+
+    def test_dry_run_returns_true_without_calling_db(self) -> None:
+        orch = self._make_orch()
+        orch.dry_run = True
+        orch._run_plesk_db = mock.MagicMock()
+        self.assertTrue(orch._domain_exists_in_plesk("anything.com"))
+        orch._run_plesk_db.assert_not_called()
+
+    def test_db_error_returns_false(self) -> None:
+        from plesk_migrator_orchestrator import PhaseExecutionError
+        orch = self._make_orch()
+        orch._run_plesk_db = mock.MagicMock(
+            side_effect=PhaseExecutionError("db down")
+        )
+        self.assertFalse(orch._domain_exists_in_plesk("opiniao.inf.br"))
+
+    def test_escapes_single_quote_in_domain(self) -> None:
+        orch = self._make_orch()
+        orch._run_plesk_db = mock.MagicMock(return_value="0\n")
+        orch._domain_exists_in_plesk("a'b.com")
+        sql = orch._run_plesk_db.call_args[0][0]
+        # Single quote must be escaped via _sql_escape (\').
+        self.assertNotIn("'a'b.com'", sql)
+        self.assertIn("a\\'b.com", sql)
+
+
 if __name__ == "__main__":
     unittest.main()

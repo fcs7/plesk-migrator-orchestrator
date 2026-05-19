@@ -1595,6 +1595,24 @@ class PleskMigrationOrchestrator:
                 labels.add(first)
         return labels
 
+    def _domain_exists_in_plesk(self, domain: str) -> bool:
+        """True iff `domain` has a row in psa.domains. Uses `plesk db -Nse`
+        via _run_plesk_db. In dry_run returns True (don't block recovery
+        logic during planning). Any PhaseExecutionError from the SQL path
+        is swallowed and treated as not-exists, since the caller wants a
+        conservative bool, not a halt."""
+        if self.dry_run:
+            return True
+        sql = (
+            "SELECT COUNT(*) FROM domains WHERE name='"
+            f"{self._sql_escape(domain)}'"
+        )
+        try:
+            out = self._run_plesk_db(sql, fetch=True)
+        except PhaseExecutionError:
+            return False
+        return out.strip() == "1"
+
     def retransfer_failed(
         self, *, max_attempts: int = MAX_RETRANSFER_ATTEMPTS,
     ) -> None:
