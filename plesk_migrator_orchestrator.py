@@ -1672,14 +1672,29 @@ class PleskMigrationOrchestrator:
                 )
                 return
             if previous_set is not None and previous_set == current_set:
-                self.logger.error(
-                    "retransfer_failed: mesmas %d subscription(s) falhando "
-                    "em 2 iterações consecutivas — aborta loop. Inspecione: %s",
-                    len(current_set), latest,
-                )
-                raise PhaseExecutionError(
-                    "retransfer_failed: progresso estagnado"
-                )
+                recoverable = {
+                    dom for dom in current_set
+                    if self._subscription_only_reserved_failures(dom, session_dir)
+                }
+                unrecoverable = current_set - recoverable
+                if recoverable:
+                    self.logger.warning(
+                        "retransfer_failed: %d subscription(s) com falha "
+                        "apenas em subdomains reservados — Plesk gerencia "
+                        "webmail nativo — aceita como partial success: %s",
+                        len(recoverable), sorted(recoverable),
+                    )
+                if unrecoverable:
+                    self.logger.error(
+                        "retransfer_failed: %d subscription(s) com falhas "
+                        "reais em 2 iterações consecutivas — aborta loop. "
+                        "Inspecione: %s",
+                        len(unrecoverable), sorted(unrecoverable),
+                    )
+                    raise PhaseExecutionError(
+                        "retransfer_failed: progresso estagnado"
+                    )
+                return
             self.logger.info(
                 "retransfer_failed: tentativa %d/%d — %d subscription(s) "
                 "em %s",
@@ -1700,10 +1715,44 @@ class PleskMigrationOrchestrator:
                 )
             previous_set = current_set
 
-        self.logger.warning(
-            "retransfer_failed: %d tentativa(s) esgotada(s). Falhas em %s",
-            max_attempts, session_dir,
+        # max_attempts reached without zero-failures. Apply the same
+        # recoverable/unrecoverable classification as the stagnation path —
+        # exhaustion alone should not silently continue when the remaining
+        # failures are real.
+        final_failed_files = [
+            f for f in sorted(session_dir.glob("failed-subscriptions.*"))
+            if f.suffix != ".bak"
+        ]
+        final_set: set[str] = (
+            self._read_failed_set(final_failed_files[-1])
+            if final_failed_files else set()
         )
+        recoverable = {
+            dom for dom in final_set
+            if self._subscription_only_reserved_failures(dom, session_dir)
+        }
+        unrecoverable = final_set - recoverable
+        if recoverable:
+            self.logger.warning(
+                "retransfer_failed: %d tentativa(s) esgotada(s); %d "
+                "subscription(s) com falha apenas em subdomains "
+                "reservados aceita(s) como partial success: %s",
+                max_attempts, len(recoverable), sorted(recoverable),
+            )
+        if unrecoverable:
+            self.logger.error(
+                "retransfer_failed: %d tentativa(s) esgotada(s). Falhas "
+                "reais em %s: %s",
+                max_attempts, session_dir, sorted(unrecoverable),
+            )
+            raise PhaseExecutionError(
+                "retransfer_failed: tentativas esgotadas com falhas reais"
+            )
+        if not recoverable:
+            self.logger.warning(
+                "retransfer_failed: %d tentativa(s) esgotada(s). Falhas "
+                "em %s", max_attempts, session_dir,
+            )
 
     def copy_web_content(self) -> None:
         self.logger.info("Fase: copy_web_content")

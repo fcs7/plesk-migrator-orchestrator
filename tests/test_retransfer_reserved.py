@@ -213,5 +213,120 @@ class SubscriptionOnlyReservedFailuresTests(unittest.TestCase):
             )
 
 
+class RetransferFailedBranchTests(unittest.TestCase):
+    """Exercises retransfer_failed stagnation + max_attempts paths with
+    helpers patched out. We're not testing the helpers themselves here —
+    earlier classes do — only the branching logic."""
+
+    def _make_orch(self, session_dir: pathlib.Path) -> PleskMigrationOrchestrator:
+        orch = PleskMigrationOrchestrator.__new__(PleskMigrationOrchestrator)
+        orch.dry_run = False
+        orch.logger = mock.MagicMock()
+        orch.plesk_migrator_bin = pathlib.Path("/usr/local/psa/admin/sbin/modules/panel-migrator/plesk-migrator")
+        orch.log_dir = session_dir / "logs"
+        orch.log_dir.mkdir()
+        orch.sessions_dir = session_dir.parent
+        orch.session_name = session_dir.name
+        orch._require_plesk_migrator_bin = mock.MagicMock()
+        orch._run = mock.MagicMock()
+        return orch
+
+    def _write_failed_file(self, session: pathlib.Path, ts: str, doms: list[str]) -> None:
+        body = "# Failed subscriptions\n" + "\n".join(doms) + "\n"
+        (session / f"failed-subscriptions.{ts}").write_text(body)
+
+    def test_stagnation_with_only_reserved_continues_without_raise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp) / "migration-session"
+            session.mkdir()
+            self._write_failed_file(session, "2026.05.19.14.06.26", ["opiniao.inf.br"])
+            orch = self._make_orch(session)
+            orch._subscription_only_reserved_failures = mock.MagicMock(return_value=True)
+            # Force second iteration to observe stagnation: _run is a no-op,
+            # so the same file is still the latest after attempt 1.
+            orch.retransfer_failed(max_attempts=3)
+            # No raise. _run called exactly once (attempt 1).
+            self.assertEqual(orch._run.call_count, 1)
+            warning_msgs = [c.args[0] for c in orch.logger.warning.call_args_list]
+            self.assertTrue(
+                any("partial success" in m for m in warning_msgs),
+                f"expected partial-success warning, got: {warning_msgs}",
+            )
+
+    def test_stagnation_with_real_failure_raises(self) -> None:
+        from plesk_migrator_orchestrator import PhaseExecutionError
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp) / "migration-session"
+            session.mkdir()
+            self._write_failed_file(session, "2026.05.19.14.06.26", ["broken.com"])
+            orch = self._make_orch(session)
+            orch._subscription_only_reserved_failures = mock.MagicMock(return_value=False)
+            with self.assertRaises(PhaseExecutionError):
+                orch.retransfer_failed(max_attempts=3)
+
+    def test_stagnation_mixed_raises(self) -> None:
+        from plesk_migrator_orchestrator import PhaseExecutionError
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp) / "migration-session"
+            session.mkdir()
+            self._write_failed_file(
+                session, "2026.05.19.14.06.26", ["opiniao.inf.br", "broken.com"]
+            )
+            orch = self._make_orch(session)
+            # Only opiniao.inf.br is recoverable.
+            orch._subscription_only_reserved_failures = mock.MagicMock(
+                side_effect=lambda dom, _sess: dom == "opiniao.inf.br"
+            )
+            with self.assertRaises(PhaseExecutionError):
+                orch.retransfer_failed(max_attempts=3)
+
+    def test_max_attempts_with_only_reserved_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp) / "migration-session"
+            session.mkdir()
+            self._write_failed_file(session, "2026.05.19.14.06.26", ["opiniao.inf.br"])
+            orch = self._make_orch(session)
+            orch._subscription_only_reserved_failures = mock.MagicMock(return_value=True)
+            # Each attempt rewrites the SAME file (timestamp identical) — but
+            # we want to hit max_attempts, not stagnation. Use a side_effect
+            # on _run that writes a NEW timestamped failed file each attempt
+            # so previous_set != current_set every iteration.
+            counter = {"i": 0}
+            def _new_failed(*args, **kwargs):
+                counter["i"] += 1
+                self._write_failed_file(
+                    session, f"2026.05.19.14.06.{30 + counter['i']:02d}",
+                    ["opiniao.inf.br"],
+                )
+                # Different content (whitespace) so the set is the same {opiniao.inf.br}
+                # but the file paths differ — keep set identical though for stagnation.
+                # Easier: leave the OLD file in place + a new one with the SAME content,
+                # but extra benign text. Actually current_set is set of domains, so
+                # to AVOID stagnation we need different domain sets each round. That's
+                # not realistic here. Instead, mock previous_set comparison by
+                # patching _read_failed_set to return ascending sets that share
+                # one common domain, ensuring no stagnation but eventual exhaust.
+                pass
+            orch._run = mock.MagicMock(side_effect=_new_failed)
+            orch._read_failed_set = mock.MagicMock(
+                side_effect=[
+                    {"opiniao.inf.br", "a.com"},
+                    {"opiniao.inf.br", "b.com"},
+                    {"opiniao.inf.br", "c.com"},
+                    # 4th call: post-loop exhaustion path reads final set
+                    {"opiniao.inf.br", "c.com"},
+                ]
+            )
+            orch.retransfer_failed(max_attempts=3)
+            # All 3 attempts ran (no stagnation, no raise on exhaust because
+            # only-reserved is True for every domain).
+            self.assertEqual(orch._run.call_count, 3)
+            warning_msgs = [c.args[0] for c in orch.logger.warning.call_args_list]
+            self.assertTrue(
+                any("partial success" in m or "esgotada" in m for m in warning_msgs),
+                f"expected exhaustion/partial-success warning, got: {warning_msgs}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
