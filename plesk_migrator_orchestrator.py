@@ -1638,6 +1638,36 @@ class PleskMigrationOrchestrator:
             log_to=self.log_dir / "copy-mail.log",
         )
 
+    @staticmethod
+    def _dir_manifest(path: pathlib.Path) -> tuple[int, int, str]:
+        """Stat-only fingerprint of a directory tree.
+
+        Returns (file_count, total_bytes, md5_hex). md5_hex hashes
+        '\n'.join(sorted "relpath:size") — content bytes are NOT read,
+        so it is fast even on multi-GB web trees and stable across rsync
+        (mtime/atime ignored). Two paths with identical manifest_hash hold
+        the same files (by name + size). Missing path or stat errors yield
+        (0, 0, md5("")). followlinks=False to avoid infinite loops on
+        symlinked vhosts."""
+        entries: list[str] = []
+        count = 0
+        total = 0
+        if path.is_dir():
+            for root, dirs, files in os.walk(path, followlinks=False):
+                dirs.sort()
+                for fname in sorted(files):
+                    fp = pathlib.Path(root) / fname
+                    try:
+                        st = fp.stat()
+                    except OSError:
+                        continue
+                    rel = fp.relative_to(path)
+                    entries.append(f"{rel}:{st.st_size}")
+                    count += 1
+                    total += st.st_size
+        digest = hashlib.md5("\n".join(entries).encode("utf-8")).hexdigest()
+        return count, total, digest
+
     def fix_docroot(self) -> None:
         """Ajusta www-root das subscriptions migradas quando plesk-migrator
         depositou conteúdo em `public_html/` (layout cPanel preservado) mas a
