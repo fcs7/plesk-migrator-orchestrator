@@ -87,6 +87,34 @@ class PickDocrootTests(unittest.TestCase):
         }
         self.assertIsNone(PleskMigrationOrchestrator._pick_docroot(manifests))
 
+    def test_hash_match_guard_returns_none_when_chosen_matches_empty_httpdocs(self) -> None:
+        # httpdocs vazio mas public_html populado com mesmo hash —
+        # cenário de symlink httpdocs→public_html (ou hardlink) deixado
+        # por um fix manual anterior. Não tem nada a refazer; skip.
+        same_hash = "samehash123samehash123samehash12"
+        manifests = {
+            "httpdocs":    (0, 0, same_hash),
+            "public_html": (5, 1000, same_hash),
+            "www":         (0, 0, "d41d8cd98f00b204e9800998ecf8427e"),
+            "web":         (0, 0, "d41d8cd98f00b204e9800998ecf8427e"),
+        }
+        self.assertIsNone(PleskMigrationOrchestrator._pick_docroot(manifests))
+
+    def test_tie_on_total_bytes_picks_first_inserted(self) -> None:
+        # public_html e www empatam em total_bytes. max() retorna o
+        # primeiro encontrado iterando dict — em CPython 3.7+ dict mantém
+        # insertion order; caller insere na ordem DOCROOT_CANDIDATES
+        # (httpdocs, public_html, www, web), então public_html vence.
+        manifests = {
+            "httpdocs":    (0, 0, "d41d8cd98f00b204e9800998ecf8427e"),
+            "public_html": (5, 1000, "bbb"),
+            "www":         (3, 1000, "ccc"),
+            "web":         (2, 50, "ddd"),
+        }
+        self.assertEqual(
+            PleskMigrationOrchestrator._pick_docroot(manifests), "public_html"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
