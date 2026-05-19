@@ -22,6 +22,7 @@ import os
 import pathlib
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import subprocess
@@ -93,6 +94,11 @@ TIMEOUT_FIX_DNS = 300          # 5 min — DELETE dns_recs cPanel-only
 TIMEOUT_FTP_AUDIT = 60         # 1 min — leitura de accounts_report_tree
 TIMEOUT_SANITIZE_LIST = 60     # 1 min — regex em migration-list
 TIMEOUT_FIX_OWNER = 1800       # 30 min — cria customer + reassign subscription
+
+# Subpastas escaneadas por fix-docroot dentro de /var/www/vhosts/<domain>/.
+# Ordem importa apenas para tie-break determinístico (mesmo total_bytes):
+# httpdocs primeiro porque é o canonical Plesk; se rivaliza com outro, vence.
+DOCROOT_CANDIDATES = ("httpdocs", "public_html", "www", "web")
 
 # Subdomains reservados pelo Plesk (primeiro label do FQDN). Aplicação cPanel
 # que use esses nomes precisa rename — sanitize-list propõe alternativas.
@@ -1551,6 +1557,88 @@ class PleskMigrationOrchestrator:
 
         self.logger.info("fix_limits: %d subscription(s) atualizada(s)", updated)
 
+    @staticmethod
+    def _parse_reserved_subdomain_failures(
+        session_dir: pathlib.Path,
+    ) -> set[str]:
+        """Parse the newest accounts_report_tree.* in `session_dir` and return
+        the set of first-label segments of subdomains that plesk-migrator
+        failed to create with the message:
+          "sites of subscription were not created - they do not exist on
+           target panel: '<host>'"
+        Returns the set of `host.split('.', 1)[0]` for every match (e.g.
+        {"webmail"} when webmail.example.com failed).
+
+        Missing session dir, no matching report, and unreadable files all
+        yield set(). Filenames sorted lexicographically — the timestamped
+        suffix is wide enough to keep that aligned with chronological order
+        for plesk-migrator output."""
+        if not session_dir.is_dir():
+            return set()
+        candidates = sorted(
+            p for p in session_dir.glob("accounts_report_tree.*")
+            if p.is_file() and ".json" not in p.suffixes
+        )
+        if not candidates:
+            return set()
+        latest = candidates[-1]
+        try:
+            text = latest.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return set()
+        pattern = re.compile(
+            r"sites of subscription were not created[^:]*:\s+'([^']+)'"
+        )
+        labels: set[str] = set()
+        for host in pattern.findall(text):
+            first = host.split(".", 1)[0].lower()
+            if first:
+                labels.add(first)
+        return labels
+
+    def _domain_exists_in_plesk(self, domain: str) -> bool:
+        """True iff `domain` has a row in psa.domains. Uses `plesk db -Nse`
+        via _run_plesk_db. In dry_run returns True (don't block recovery
+        logic during planning). Any PhaseExecutionError from the SQL path
+        is swallowed and treated as not-exists, since the caller wants a
+        conservative bool, not a halt."""
+        if self.dry_run:
+            return True
+        sql = (
+            "SELECT COUNT(*) FROM domains WHERE name='"
+            f"{self._sql_escape(domain)}'"
+        )
+        try:
+            out = self._run_plesk_db(sql, fetch=True)
+        except PhaseExecutionError:
+            return False
+        return out.strip() == "1"
+
+    def _subscription_only_reserved_failures(
+        self, domain: str, session_dir: pathlib.Path,
+    ) -> bool:
+        """Classify a `failed-subscriptions` entry as recoverable.
+
+        Returns True iff:
+          1. The newest accounts_report_tree.* contains at least one
+             "sites of subscription were not created" failure.
+          2. ALL such failures are first-label members of
+             RESERVED_PLESK_SUBDOMAINS (webmail, mail, ftp, ...).
+          3. `domain` already exists in psa.domains (subscription was
+             created by plesk-migrator before the reserved subdomain hit
+             the wall — so we have working hosting, just not the blocked
+             subdomain that Plesk would refuse anyway).
+
+        Used by retransfer_failed to skip retrying domains that will never
+        succeed (Plesk reserves these subdomain names) but whose parent
+        subscription is already operational."""
+        labels = self._parse_reserved_subdomain_failures(session_dir)
+        if not labels:
+            return False
+        if not labels.issubset(set(RESERVED_PLESK_SUBDOMAINS)):
+            return False
+        return self._domain_exists_in_plesk(domain)
+
     def retransfer_failed(
         self, *, max_attempts: int = MAX_RETRANSFER_ATTEMPTS,
     ) -> None:
@@ -1585,14 +1673,29 @@ class PleskMigrationOrchestrator:
                 )
                 return
             if previous_set is not None and previous_set == current_set:
-                self.logger.error(
-                    "retransfer_failed: mesmas %d subscription(s) falhando "
-                    "em 2 iterações consecutivas — aborta loop. Inspecione: %s",
-                    len(current_set), latest,
-                )
-                raise PhaseExecutionError(
-                    "retransfer_failed: progresso estagnado"
-                )
+                recoverable = {
+                    dom for dom in current_set
+                    if self._subscription_only_reserved_failures(dom, session_dir)
+                }
+                unrecoverable = current_set - recoverable
+                if recoverable:
+                    self.logger.warning(
+                        "retransfer_failed: %d subscription(s) com falha "
+                        "apenas em subdomains reservados — Plesk gerencia "
+                        "webmail nativo — aceita como partial success: %s",
+                        len(recoverable), sorted(recoverable),
+                    )
+                if unrecoverable:
+                    self.logger.error(
+                        "retransfer_failed: %d subscription(s) com falhas "
+                        "reais em 2 iterações consecutivas — aborta loop. "
+                        "Inspecione: %s",
+                        len(unrecoverable), sorted(unrecoverable),
+                    )
+                    raise PhaseExecutionError(
+                        "retransfer_failed: progresso estagnado"
+                    )
+                return
             self.logger.info(
                 "retransfer_failed: tentativa %d/%d — %d subscription(s) "
                 "em %s",
@@ -1613,10 +1716,44 @@ class PleskMigrationOrchestrator:
                 )
             previous_set = current_set
 
-        self.logger.warning(
-            "retransfer_failed: %d tentativa(s) esgotada(s). Falhas em %s",
-            max_attempts, session_dir,
+        # max_attempts reached without zero-failures. Apply the same
+        # recoverable/unrecoverable classification as the stagnation path —
+        # exhaustion alone should not silently continue when the remaining
+        # failures are real.
+        final_failed_files = [
+            f for f in sorted(session_dir.glob("failed-subscriptions.*"))
+            if f.suffix != ".bak"
+        ]
+        final_set: set[str] = (
+            self._read_failed_set(final_failed_files[-1])
+            if final_failed_files else set()
         )
+        recoverable = {
+            dom for dom in final_set
+            if self._subscription_only_reserved_failures(dom, session_dir)
+        }
+        unrecoverable = final_set - recoverable
+        if recoverable:
+            self.logger.warning(
+                "retransfer_failed: %d tentativa(s) esgotada(s); %d "
+                "subscription(s) com falha apenas em subdomains "
+                "reservados aceita(s) como partial success: %s",
+                max_attempts, len(recoverable), sorted(recoverable),
+            )
+        if unrecoverable:
+            self.logger.error(
+                "retransfer_failed: %d tentativa(s) esgotada(s). Falhas "
+                "reais em %s: %s",
+                max_attempts, session_dir, sorted(unrecoverable),
+            )
+            raise PhaseExecutionError(
+                "retransfer_failed: tentativas esgotadas com falhas reais"
+            )
+        if not recoverable:
+            self.logger.warning(
+                "retransfer_failed: %d tentativa(s) esgotada(s). Falhas "
+                "em %s", max_attempts, session_dir,
+            )
 
     def copy_web_content(self) -> None:
         self.logger.info("Fase: copy_web_content")
@@ -1638,17 +1775,212 @@ class PleskMigrationOrchestrator:
             log_to=self.log_dir / "copy-mail.log",
         )
 
+    @staticmethod
+    def _dir_manifest(path: pathlib.Path) -> tuple[int, int, str]:
+        """Stat-only fingerprint of a directory tree.
+
+        Returns (file_count, total_bytes, md5_hex). md5_hex hashes
+        '\n'.join(sorted "relpath:size") — content bytes are NOT read,
+        so it is fast even on multi-GB web trees and stable across rsync
+        (mtime/atime ignored). Two paths with identical manifest_hash hold
+        the same files (by name + size). Missing path or stat errors yield
+        (0, 0, md5("")). followlinks=False to avoid infinite loops on
+        symlinked vhosts."""
+        entries: list[str] = []
+        count = 0
+        total = 0
+        if path.is_dir():
+            for root, dirs, files in os.walk(path, followlinks=False):
+                dirs.sort()
+                for fname in sorted(files):
+                    fp = pathlib.Path(root) / fname
+                    try:
+                        st = fp.stat()
+                    except OSError:
+                        continue
+                    rel = fp.relative_to(path)
+                    entries.append(f"{rel}:{st.st_size}")
+                    count += 1
+                    total += st.st_size
+        digest = hashlib.md5("\n".join(entries).encode("utf-8")).hexdigest()
+        return count, total, digest
+
+    def _validate_docroot_match(
+        self, domain: str, local_path: pathlib.Path,
+    ) -> None:
+        """Compare cPanel source public_html with the Plesk dir just set
+        as www-root. Pure observation — divergence logs a warning, never
+        raises. Empty remote manifest (SSH failed, sshpass missing, etc.)
+        logs a 'pulada' warning so the operator notices but the pipeline
+        continues."""
+        cpanel_user = domain.split(".", 1)[0]  # best-effort default; cPanel
+        # accounts are typically named after the first label or a truncation
+        # — operators with exotic mappings can extend this later.
+        remote_path = f"/home/{cpanel_user}/public_html"
+        src_count, src_bytes, src_hash = self._remote_dir_manifest(remote_path)
+        if not src_hash:
+            self.logger.warning(
+                "fix-docroot: %s — validação cross-server pulada "
+                "(SSH falhou ou caminho %s inacessível)",
+                domain, remote_path,
+            )
+            return
+        dst_count, dst_bytes, dst_hash = self._dir_manifest(local_path)
+        if src_hash == dst_hash:
+            self.logger.info(
+                "fix-docroot: %s — hash OK (%d arquivos, %d bytes, %s)",
+                domain, dst_count, dst_bytes, dst_hash[:8],
+            )
+            return
+        self.logger.warning(
+            "fix-docroot: %s — hash DIVERGE "
+            "src(%d arq / %d B / %s) dst(%d arq / %d B / %s)",
+            domain, src_count, src_bytes, src_hash[:8],
+            dst_count, dst_bytes, dst_hash[:8],
+        )
+
+    def _remote_dir_manifest(
+        self, remote_path: str,
+    ) -> tuple[int, int, str]:
+        """Cross-server analogue of _dir_manifest.
+
+        Runs over SSH on the cPanel source host (host/port/password from
+        self.config["source"]). Pipeline:
+
+          find <path> -type f -printf '%P:%s\n' | sort -u > /tmp/m.$$
+          COUNT=$(wc -l < /tmp/m.$$)
+          TOTAL=$(awk -F: '{s+=$NF} END{print s+0}' /tmp/m.$$)
+          MD5=$(md5sum /tmp/m.$$ | awk '{print $1}')
+          # but md5sum hashes the file bytes — we want md5 over the
+          # joined-by-newlines body, identical to _dir_manifest. So we
+          # hash the file directly: md5sum < /tmp/m.$$ → that's the same
+          # because each entry is one line "p:s\n", joined by newlines.
+          # However _dir_manifest uses "\n".join (NO trailing \n). To
+          # match, strip the trailing newline server-side before md5sum.
+
+        Output format:
+          COUNT=<n>\nTOTAL=<b>\nMD5=<hex>\n
+
+        Returns (0, 0, "") on any failure (ssh missing, sshpass missing,
+        non-zero rc, malformed output, dry_run). Never raises — caller
+        treats divergence as a warning only."""
+        if self.dry_run:
+            return 0, 0, ""
+        src = self.config.get("source") or {}
+        host = src.get("host")
+        password = src.get("ssh_password")
+        port = int(src.get("ssh_port", 22))
+        if not host or not password:
+            return 0, 0, ""
+        # Shell pipeline. `printf '%s' "$body"` strips the trailing newline
+        # so md5 matches _dir_manifest's "\n".join semantics exactly.
+        remote_cmd = (
+            f"set -e; "
+            f"body=$(find {shlex.quote(remote_path)} -type f "
+            f"-printf '%P:%s\\n' 2>/dev/null | sort -u); "
+            f"count=$(printf '%s\\n' \"$body\" | grep -c '^' || true); "
+            f"if [ -z \"$body\" ]; then count=0; fi; "
+            f"total=$(printf '%s\\n' \"$body\" | awk -F: '{{s+=$NF}} "
+            f"END{{print s+0}}'); "
+            f"md5=$(printf '%s' \"$body\" | md5sum | awk '{{print $1}}'); "
+            f"echo \"COUNT=$count\"; echo \"TOTAL=$total\"; echo \"MD5=$md5\""
+        )
+        argv = [
+            "sshpass", "-p", str(password),
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=15",
+            "-o", "BatchMode=no",
+            "-p", str(port),
+            f"root@{host}",
+            remote_cmd,
+        ]
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True,
+                timeout=180, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.logger.warning(
+                "_remote_dir_manifest: ssh falhou: %s", exc,
+            )
+            return 0, 0, ""
+        if proc.returncode != 0:
+            self.logger.warning(
+                "_remote_dir_manifest: rc=%d stderr=%s",
+                proc.returncode, proc.stderr.strip()[:200],
+            )
+            return 0, 0, ""
+        count = total = 0
+        digest = ""
+        for line in proc.stdout.splitlines():
+            if line.startswith("COUNT="):
+                try:
+                    count = int(line.split("=", 1)[1])
+                except ValueError:
+                    return 0, 0, ""
+            elif line.startswith("TOTAL="):
+                try:
+                    total = int(line.split("=", 1)[1])
+                except ValueError:
+                    return 0, 0, ""
+            elif line.startswith("MD5="):
+                digest = line.split("=", 1)[1].strip()
+        if not digest:
+            return 0, 0, ""
+        return count, total, digest
+
+    @staticmethod
+    def _pick_docroot(
+        manifests: dict[str, tuple[int, int, str]],
+    ) -> str | None:
+        """Decide which candidate `<vhost>/<name>` should be www-root.
+
+        Input: {candidate_name: (file_count, total_bytes, manifest_hash)}.
+        Returns the candidate name to point www-root at, or None when no
+        action is needed:
+          - all candidates empty
+          - httpdocs already has content (canonical wins, even if another
+            candidate also has content — we don't move a working site)
+          - the richest non-canonical candidate has the same manifest_hash
+            as httpdocs (symlinked / hardlinked / prior partial fix)
+
+        Tie-break on total_bytes picks the first key in insertion order,
+        which matches DOCROOT_CANDIDATES ordering."""
+        httpdocs = manifests.get("httpdocs", (0, 0, ""))
+        rich = {k: v for k, v in manifests.items() if v[0] > 0}
+        if not rich:
+            return None
+        if httpdocs[0] > 0:
+            return None
+        # httpdocs is empty; pick the heaviest non-httpdocs candidate
+        best_name = max(
+            (k for k in rich if k != "httpdocs"),
+            key=lambda k: rich[k][1],
+            default=None,
+        )
+        if best_name is None:
+            return None
+        if rich[best_name][2] == httpdocs[2]:
+            return None
+        return best_name
+
     def fix_docroot(self) -> None:
-        """Ajusta www-root das subscriptions migradas quando plesk-migrator
-        depositou conteúdo em `public_html/` (layout cPanel preservado) mas a
-        subscription Plesk continua apontando para `httpdocs/` (default vazio).
+        """Ajusta www-root das subscriptions migradas detectando onde
+        plesk-migrator depositou o conteúdo. Escaneia DOCROOT_CANDIDATES
+        em /var/www/vhosts/<domain>/, gera manifest stat-only por path
+        (count + bytes + md5 de filename:size), e via _pick_docroot
+        decide se ajusta.
 
         Idempotente:
-          - skip se vhost ausente
-          - skip se public_html vazio (nada a apontar)
-          - skip se httpdocs já populado (não-vazio = docroot ok ou usuário
-            já corrigiu)
-        """
+          - httpdocs já populado → skip
+          - tudo vazio → skip (vhost ainda não recebeu conteúdo)
+          - melhor candidato hash-igual a httpdocs (symlink/hardlink) → skip
+          - caso contrário → `plesk bin subscription -u <dom> -www-root <path>`
+
+        Log detalhado em <log_dir>/fix-docroot.log: por domínio, todos os
+        candidatos escaneados (count/bytes/hash truncado) + decisão."""
         self.logger.info("Fase: fix_docroot")
         if not self.plesk_bin:
             raise PhaseExecutionError(
@@ -1664,63 +1996,74 @@ class PleskMigrationOrchestrator:
             )
             return
 
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.logger.warning("fix_docroot: log_dir mkdir falhou: %s", exc)
+        report = self.log_dir / "fix-docroot.log"
+
         vhosts_root = pathlib.Path("/var/www/vhosts")
         for domain in domains:
             vhost = vhosts_root / domain
-            httpdocs = vhost / "httpdocs"
-            public_html = vhost / "public_html"
-
             if not vhost.is_dir():
                 self.logger.warning(
                     "fix_docroot: vhost %s ausente — skip", vhost
                 )
                 continue
-            if not public_html.is_dir():
-                self.logger.info(
-                    "fix_docroot: %s sem public_html — skip", domain
-                )
-                continue
+
+            manifests: dict[str, tuple[int, int, str]] = {}
+            for name in DOCROOT_CANDIDATES:
+                manifests[name] = self._dir_manifest(vhost / name)
+
+            scan_summary = ", ".join(
+                f"{n}={c}f/{b}B/{h[:8]}"
+                for n, (c, b, h) in manifests.items()
+            )
+            self.logger.info("fix_docroot: %s scan: %s", domain, scan_summary)
+
             try:
-                ph_has_content = any(public_html.iterdir())
+                with report.open("a", encoding="utf-8") as fh:
+                    ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                    fh.write(f"# {ts} {domain}\n")
+                    for n, (c, b, h) in manifests.items():
+                        fh.write(f"  {n}: count={c} bytes={b} hash={h}\n")
             except OSError as exc:
                 self.logger.warning(
-                    "fix_docroot: erro lendo %s: %s — skip", public_html, exc
+                    "fix_docroot: falha escrevendo report: %s", exc
                 )
-                continue
-            if not ph_has_content:
+
+            choice = self._pick_docroot(manifests)
+            if choice is None:
                 self.logger.info(
-                    "fix_docroot: %s public_html vazio — skip", domain
-                )
-                continue
-            try:
-                ht_has_content = httpdocs.is_dir() and any(httpdocs.iterdir())
-            except OSError as exc:
-                self.logger.warning(
-                    "fix_docroot: erro lendo %s: %s — skip", httpdocs, exc
-                )
-                continue
-            if ht_has_content:
-                self.logger.info(
-                    "fix_docroot: %s httpdocs já populado — skip", domain
+                    "fix_docroot: %s nada a ajustar — skip", domain
                 )
                 continue
 
+            target = vhost / choice
             self.logger.info(
-                "fix_docroot: ajustando www-root de %s → %s", domain, public_html
+                "fix_docroot: %s → apontando www-root para %s "
+                "(%d arquivos, %d bytes)",
+                domain, target, manifests[choice][0], manifests[choice][1],
             )
             if self.dry_run:
                 self.logger.info(
                     "[DRY-RUN] %s bin subscription -u %s -www-root %s",
-                    self.plesk_bin, domain, public_html,
+                    self.plesk_bin, domain, target,
                 )
                 continue
 
             self._run(
                 [str(self.plesk_bin), "bin", "subscription",
-                 "-u", domain, "-www-root", str(public_html)],
+                 "-u", domain, "-www-root", str(target)],
                 timeout=TIMEOUT_FIX_DOCROOT,
-                log_to=self.log_dir / "fix-docroot.log",
+                log_to=report,
             )
+
+            # Cross-server hash validation: compare cPanel source public_html
+            # against the Plesk dir we just pointed www-root at. Divergence
+            # logs a warning only — never aborts migration.
+            if not self.dry_run:
+                self._validate_docroot_match(domain, target)
 
     def fix_mailpath(self, *, apply: bool = False) -> None:
         """Audita onde plesk-migrator depositou Maildirs vs onde o Plesk
