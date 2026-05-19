@@ -2146,7 +2146,7 @@ class PleskMigrationOrchestrator:
         indica dono cPanel. Audit default lista mismatches em
         <log_dir>/owner-mismatches.csv. Com apply=True cria customer
         ausente (login slugificado, senha urlsafe(16)) e reassigna via
-        `plesk bin subscription -u <dom> -owner <login>`. Senhas em
+        `plesk bin subscription --change-owner <dom> -owner <login>`. Senhas em
         <log_dir>/owner-fix.csv chmod 600 — distribua fora-de-banda."""
         self.logger.info("Fase: fix_owner (apply=%s)", apply)
         if not self.plesk_bin:
@@ -2993,7 +2993,7 @@ def _build_parser() -> argparse.ArgumentParser:
                              "(login slugificado, senha urlsafe(16) em "
                              "<log_dir>/owner-fix.csv chmod 600) e "
                              "reassigna subscription via "
-                             "`plesk bin subscription -u <dom> -owner <login>`. "
+                             "`plesk bin subscription --change-owner <dom> -owner <login>`. "
                              "Distribua senhas via canal seguro fora-de-banda.")
     parser.add_argument(
         "--resume", action="store_true",
