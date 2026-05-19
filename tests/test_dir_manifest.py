@@ -47,7 +47,7 @@ class DirManifestTests(unittest.TestCase):
             b = root / "b"
             for d in (a, b):
                 d.mkdir()
-                (d / "index.php").write_text("<?php echo 1;")  # 14 bytes
+                (d / "index.php").write_text("<?php echo 1;")  # 13 bytes
                 (d / "wp-config.php").write_text("XXXXX")      # 5 bytes
 
             _, _, digest_a = PleskMigrationOrchestrator._dir_manifest(a)
@@ -81,6 +81,7 @@ class DirManifestTests(unittest.TestCase):
             )
             self.assertEqual(count, 0)
             self.assertEqual(total, 0)
+            self.assertEqual(digest, hashlib.md5(b"").hexdigest())
 
 
 if __name__ == "__main__":
