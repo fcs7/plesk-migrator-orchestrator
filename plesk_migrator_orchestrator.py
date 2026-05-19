@@ -92,6 +92,7 @@ TIMEOUT_FIX_MAIL_QUOTA = 300   # 5 min — UPDATE mail.mbox_quota
 TIMEOUT_FIX_DNS = 300          # 5 min — DELETE dns_recs cPanel-only
 TIMEOUT_FTP_AUDIT = 60         # 1 min — leitura de accounts_report_tree
 TIMEOUT_SANITIZE_LIST = 60     # 1 min — regex em migration-list
+TIMEOUT_FIX_OWNER = 1800       # 30 min — cria customer + reassign subscription
 
 # Subdomains reservados pelo Plesk (primeiro label do FQDN). Aplicação cPanel
 # que use esses nomes precisa rename — sanitize-list propõe alternativas.
@@ -146,6 +147,7 @@ PHASES_ORDER = [
     "transfer",
     "fix-limits",
     "retransfer-failed",
+    "fix-owner",
     "copy-web",
     "copy-mail",
     "fix-mailpath",
@@ -1025,6 +1027,64 @@ class PleskMigrationOrchestrator:
                                       len(domains), path.name)
                     return domains
         return []
+
+    _OWNER_HEADER_RE = re.compile(
+        r"^\s*(Customer|Reseller|Plan)\s*:\s*(.+?)\s*$", re.IGNORECASE
+    )
+    _LOGIN_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+    def _load_migrated_owners(self) -> dict[str, list[str]]:
+        """Parseia successful-subscriptions.<ts> mais recente, retorna
+        {customer_name: [domains]} apenas para domínios sob bloco `Customer:`.
+        Domínios sob `Reseller:`/`Plan:`/Admin não entram (ficam em
+        cl_id=0 — comportamento padrão). Vazio = nada para reatribuir."""
+        session_dir = self.sessions_dir / self.session_name
+        if not session_dir.is_dir():
+            return {}
+        candidates = sorted(session_dir.glob("successful-subscriptions.*"))
+        candidates = [c for c in candidates if c.suffix != ".bak"]
+        if not candidates:
+            return {}
+        cand = candidates[-1]
+        try:
+            lines = cand.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            self.logger.warning(
+                "_load_migrated_owners: falha lendo %s: %s", cand, exc
+            )
+            return {}
+        owners: dict[str, list[str]] = {}
+        current: str | None = None
+        for raw in lines:
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            m = self._OWNER_HEADER_RE.match(raw)
+            if m:
+                kind = m.group(1).lower()
+                current = m.group(2).strip() if kind == "customer" else None
+                continue
+            candidate = stripped.lower()
+            if not self._FQDN_RE.match(candidate):
+                continue
+            if current is not None:
+                owners.setdefault(current, []).append(candidate)
+        return owners
+
+    def _slugify_login(self, name: str) -> str:
+        """Login Plesk: lowercase [a-z0-9_], começa com letra, max 32 chars."""
+        s = self._LOGIN_SLUG_RE.sub("_", name.lower()).strip("_")
+        if not s:
+            s = "customer"
+        if not s[0].isalpha():
+            s = f"c_{s}"
+        return s[:32]
+
+    @staticmethod
+    def _csv_quote(v: str) -> str:
+        if any(c in v for c in (',', '"', '\n', '\r')):
+            return '"' + v.replace('"', '""') + '"'
+        return v
 
     def ensure_plesk_migrator_installed(self) -> None:
         self.logger.info("Fase: ensure_plesk_migrator_installed")
@@ -2070,6 +2130,207 @@ class PleskMigrationOrchestrator:
                 "nada removido (audit-only). Inspect ftp-renames/log."
             )
 
+    def fix_owner(self, *, apply: bool = False) -> None:
+        """Reatribui owner de subscriptions migradas que ficaram em Admin
+        (cl_id=0) quando o bloco `Customer:` da successful-subscriptions
+        indica dono cPanel. Audit default lista mismatches em
+        <log_dir>/owner-mismatches.csv. Com apply=True cria customer
+        ausente (login slugificado, senha urlsafe(16)) e reassigna via
+        `plesk bin subscription -u <dom> -owner <login>`. Senhas em
+        <log_dir>/owner-fix.csv chmod 600 — distribua fora-de-banda."""
+        self.logger.info("Fase: fix_owner (apply=%s)", apply)
+        if not self.plesk_bin:
+            self.logger.warning(
+                "fix_owner: binário 'plesk' não localizado — skip"
+            )
+            return
+
+        owners_map = self._load_migrated_owners()
+        if not owners_map:
+            self.logger.info(
+                "fix_owner: nenhum bloco `Customer:` em "
+                "successful-subscriptions — nada para reatribuir."
+            )
+            return
+
+        domain_to_expected: dict[str, str] = {}
+        for cust, doms in owners_map.items():
+            for d in doms:
+                domain_to_expected[d] = cust
+
+        placeholders = ",".join(
+            f"'{self._sql_escape(d)}'" for d in domain_to_expected
+        )
+        sql = (
+            f"SELECT d.name, COALESCE(c.login, '__admin__') "
+            f"FROM domains d "
+            f"LEFT JOIN clients c ON d.cl_id=c.id "
+            f"WHERE d.name IN ({placeholders});"
+        )
+        try:
+            stdout = self._run_plesk_db(sql, fetch=True)
+        except PhaseExecutionError as exc:
+            self.logger.warning("fix_owner: query falhou — %s", exc)
+            return
+
+        current_owners: dict[str, str] = {}
+        for ln in stdout.splitlines():
+            parts = ln.strip().split("\t")
+            if len(parts) >= 2:
+                current_owners[parts[0].lower()] = parts[1].strip()
+
+        mismatches: list[tuple[str, str, str]] = []
+        for dom, expected_cust in domain_to_expected.items():
+            cur = current_owners.get(dom, "__missing__")
+            if cur in ("__admin__", "__missing__"):
+                mismatches.append((dom, expected_cust, cur))
+
+        if not mismatches:
+            self.logger.info(
+                "fix_owner: 0 mismatches — todos domínios já têm Customer."
+            )
+            return
+
+        self.logger.warning(
+            "fix_owner: %d domínio(s) sem Customer — esperado Customer "
+            "do bloco successful-subscriptions.",
+            len(mismatches),
+        )
+        for dom, cust, cur in mismatches[:10]:
+            self.logger.warning(
+                "  %s → esperado=%s (atual=%s)", dom, cust, cur
+            )
+        if len(mismatches) > 10:
+            self.logger.warning("  ... e mais %d.", len(mismatches) - 10)
+
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            audit_csv = self.log_dir / "owner-mismatches.csv"
+            new_audit = not audit_csv.exists()
+            with audit_csv.open("a", encoding="utf-8") as fh:
+                if new_audit:
+                    fh.write("timestamp,domain,expected_customer,"
+                             "proposed_login,current_owner\n")
+                ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                for dom, cust, cur in mismatches:
+                    login = self._slugify_login(cust)
+                    fh.write(
+                        f"{ts},{dom},{self._csv_quote(cust)},"
+                        f"{login},{cur}\n"
+                    )
+        except OSError as exc:
+            self.logger.warning("fix_owner: falha gravando audit CSV: %s", exc)
+
+        if not apply:
+            self.logger.warning(
+                "fix_owner: rode com --apply-owner-fix para criar "
+                "customers ausentes e reassign owner."
+            )
+            return
+
+        by_customer: dict[str, list[str]] = {}
+        for dom, cust, _cur in mismatches:
+            by_customer.setdefault(cust, []).append(dom)
+
+        secrets_csv = self.log_dir / "owner-fix.csv"
+        new_secrets = not secrets_csv.exists()
+        try:
+            secrets_csv.touch(mode=0o600, exist_ok=True)
+            os.chmod(secrets_csv, 0o600)
+        except OSError as exc:
+            raise PhaseExecutionError(
+                f"fix_owner: não consegui criar {secrets_csv}: {exc}"
+            ) from exc
+
+        created = 0
+        reassigned = 0
+        with secrets_csv.open("a", encoding="utf-8") as fh:
+            if new_secrets:
+                fh.write("timestamp,customer_name,login,password,email,"
+                         "domains\n")
+            for cust, doms in by_customer.items():
+                login = self._slugify_login(cust)
+                email = f"{login}@example.invalid"
+                password = ""
+
+                exists = False
+                if not self.dry_run:
+                    try:
+                        check = subprocess.run(
+                            [str(self.plesk_bin), "bin", "customer",
+                             "--info", login],
+                            capture_output=True, text=True,
+                            timeout=60, check=False,
+                        )
+                        exists = check.returncode == 0
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        self.logger.error(
+                            "fix_owner: falha verificando customer %s: %s",
+                            login, exc,
+                        )
+                        continue
+
+                if not exists:
+                    while True:
+                        password = secrets.token_urlsafe(16)
+                        if password[0] not in "-_":
+                            break
+                    self.sensitive_values.append(password)
+                    try:
+                        self._run(
+                            [str(self.plesk_bin), "bin", "customer",
+                             "--create", login, "-passwd", password,
+                             "-cname", cust, "-email", email,
+                             "-status", "active"],
+                            timeout=TIMEOUT_FIX_OWNER,
+                            log_to=self.log_dir / "fix-owner.log",
+                        )
+                        created += 1
+                    except (PhaseExecutionError,
+                            subprocess.CalledProcessError) as exc:
+                        self.logger.error(
+                            "fix_owner: falha criando customer %s (%s): %s",
+                            login, cust, exc,
+                        )
+                        continue
+
+                ok_doms: list[str] = []
+                for dom in doms:
+                    try:
+                        self._run(
+                            [str(self.plesk_bin), "bin", "subscription",
+                             "-u", dom, "-owner", login],
+                            timeout=120,
+                            log_to=self.log_dir / "fix-owner.log",
+                        )
+                        ok_doms.append(dom)
+                        reassigned += 1
+                    except (PhaseExecutionError,
+                            subprocess.CalledProcessError) as exc:
+                        self.logger.error(
+                            "fix_owner: falha reassign %s → %s: %s",
+                            dom, login, exc,
+                        )
+
+                ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                pwd_field = password if password else "(customer-pre-existente)"
+                fh.write(
+                    f"{ts},{self._csv_quote(cust)},{login},{pwd_field},"
+                    f"{email},{';'.join(ok_doms)}\n"
+                )
+
+        try:
+            os.chmod(secrets_csv, 0o600)
+        except OSError:
+            pass
+
+        self.logger.warning(
+            "fix_owner: %d customer(s) criado(s), %d subscription(s) "
+            "reassign — CSV: %s (distribua senhas via canal seguro "
+            "fora-de-banda).",
+            created, reassigned, secrets_csv,
+        )
+
     def copy_db_content(self) -> None:
         self.logger.info("Fase: copy_db_content")
         self._require_plesk_migrator_bin()
@@ -2179,6 +2440,8 @@ class PleskMigrationOrchestrator:
         skip_fix_dns_conflicts: bool = False,
         apply_dns_cleanup: bool = False,
         apply_mailpath_fix: bool = False,
+        skip_fix_owner: bool = False,
+        apply_owner_fix: bool = False,
         start_from: str | None = None,
     ) -> None:
         behavior = self.config.get("behavior") or {}
@@ -2238,6 +2501,12 @@ class PleskMigrationOrchestrator:
         apply_mailpath_fix = (
             apply_mailpath_fix or behavior.get("apply_mailpath_fix", False)
         )
+        skip_fix_owner = (
+            skip_fix_owner or behavior_skip.get("fix_owner", False)
+        )
+        apply_owner_fix = (
+            apply_owner_fix or behavior.get("apply_owner_fix", False)
+        )
         start_from = start_from or self.start_from or behavior.get("start_from")
 
         if self.resume:
@@ -2285,6 +2554,9 @@ class PleskMigrationOrchestrator:
                  max_attempts=max_retransfer_attempts,
              ),
              not skip_retransfer_failed),
+            ("fix-owner",
+             lambda: self.fix_owner(apply=apply_owner_fix),
+             not skip_fix_owner),
             ("copy-web", self.copy_web_content, not skip_web_content),
             ("copy-mail", self.copy_mail_content, not skip_mail_content),
             ("fix-mailpath",
@@ -2702,6 +2974,16 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Em fix-mailpath, rsync Maildirs em path "
                              "alternativo para canonical Plesk + "
                              "`plesk repair mail`.")
+    parser.add_argument("--skip-fix-owner", action="store_true",
+                        help="Pula reatribuição de owner pós-transfer "
+                             "(fase fix-owner)")
+    parser.add_argument("--apply-owner-fix", action="store_true",
+                        help="Em fix-owner, cria customer ausente "
+                             "(login slugificado, senha urlsafe(16) em "
+                             "<log_dir>/owner-fix.csv chmod 600) e "
+                             "reassigna subscription via "
+                             "`plesk bin subscription -u <dom> -owner <login>`. "
+                             "Distribua senhas via canal seguro fora-de-banda.")
     parser.add_argument(
         "--resume", action="store_true",
         help="Retoma sessão existente: pula generate-migration-list se já "
@@ -2819,6 +3101,8 @@ def main(argv: list[str] | None = None) -> int:
             skip_fix_dns_conflicts=args.skip_fix_dns_conflicts,
             apply_dns_cleanup=args.apply_dns_cleanup,
             apply_mailpath_fix=args.apply_mailpath_fix,
+            skip_fix_owner=args.skip_fix_owner,
+            apply_owner_fix=args.apply_owner_fix,
             start_from=start_from,
         )
     except LockError as exc:
