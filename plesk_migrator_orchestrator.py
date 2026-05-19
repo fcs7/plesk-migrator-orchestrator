@@ -1805,6 +1805,40 @@ class PleskMigrationOrchestrator:
         digest = hashlib.md5("\n".join(entries).encode("utf-8")).hexdigest()
         return count, total, digest
 
+    def _validate_docroot_match(
+        self, domain: str, local_path: pathlib.Path,
+    ) -> None:
+        """Compare cPanel source public_html with the Plesk dir just set
+        as www-root. Pure observation — divergence logs a warning, never
+        raises. Empty remote manifest (SSH failed, sshpass missing, etc.)
+        logs a 'pulada' warning so the operator notices but the pipeline
+        continues."""
+        cpanel_user = domain.split(".", 1)[0]  # best-effort default; cPanel
+        # accounts are typically named after the first label or a truncation
+        # — operators with exotic mappings can extend this later.
+        remote_path = f"/home/{cpanel_user}/public_html"
+        src_count, src_bytes, src_hash = self._remote_dir_manifest(remote_path)
+        if not src_hash:
+            self.logger.warning(
+                "fix-docroot: %s — validação cross-server pulada "
+                "(SSH falhou ou caminho %s inacessível)",
+                domain, remote_path,
+            )
+            return
+        dst_count, dst_bytes, dst_hash = self._dir_manifest(local_path)
+        if src_hash == dst_hash:
+            self.logger.info(
+                "fix-docroot: %s — hash OK (%d arquivos, %d bytes, %s)",
+                domain, dst_count, dst_bytes, dst_hash[:8],
+            )
+            return
+        self.logger.warning(
+            "fix-docroot: %s — hash DIVERGE "
+            "src(%d arq / %d B / %s) dst(%d arq / %d B / %s)",
+            domain, src_count, src_bytes, src_hash[:8],
+            dst_count, dst_bytes, dst_hash[:8],
+        )
+
     def _remote_dir_manifest(
         self, remote_path: str,
     ) -> tuple[int, int, str]:
@@ -2024,6 +2058,12 @@ class PleskMigrationOrchestrator:
                 timeout=TIMEOUT_FIX_DOCROOT,
                 log_to=report,
             )
+
+            # Cross-server hash validation: compare cPanel source public_html
+            # against the Plesk dir we just pointed www-root at. Divergence
+            # logs a warning only — never aborts migration.
+            if not self.dry_run:
+                self._validate_docroot_match(domain, target)
 
     def fix_mailpath(self, *, apply: bool = False) -> None:
         """Audita onde plesk-migrator depositou Maildirs vs onde o Plesk

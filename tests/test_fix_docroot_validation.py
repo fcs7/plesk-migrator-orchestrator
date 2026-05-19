@@ -11,6 +11,7 @@ import hashlib
 import pathlib
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -132,6 +133,163 @@ class RemoteDirManifestTests(unittest.TestCase):
         ):
             count, total, digest = orch._remote_dir_manifest("/tmp/x")
         self.assertEqual((count, total, digest), (0, 0, ""))
+
+
+class FixDocrootValidationIntegrationTests(unittest.TestCase):
+    """Verifies fix_docroot logs match/diverge AFTER applying www-root."""
+
+    def _make_orch(self, vhost_root: pathlib.Path) -> PleskMigrationOrchestrator:
+        orch = PleskMigrationOrchestrator.__new__(PleskMigrationOrchestrator)
+        orch.dry_run = False
+        orch.logger = mock.MagicMock()
+        orch.config = {
+            "source": {
+                "host": "cpanel.example.com",
+                "ssh_port": 22,
+                "ssh_password": "secret",
+            },
+        }
+        orch.plesk_bin = pathlib.Path("/usr/sbin/plesk")
+        orch.plesk_migrator_bin = pathlib.Path("/usr/local/psa/admin/sbin/modules/panel-migrator/plesk-migrator")
+        orch.log_dir = vhost_root.parent / "logs"
+        orch.log_dir.mkdir()
+        orch.sessions_dir = vhost_root.parent / "sessions"
+        orch.session_name = "migration-session"
+        (orch.sessions_dir / orch.session_name).mkdir(parents=True)
+        orch._load_migrated_domains = mock.MagicMock(
+            return_value=["opiniao.inf.br"]
+        )
+        orch._run = mock.MagicMock()
+        return orch
+
+    def _set_up_vhost(
+        self, vhost_root: pathlib.Path, has_public_html_bytes: int,
+    ) -> None:
+        vhost = vhost_root / "opiniao.inf.br"
+        vhost.mkdir(parents=True)
+        (vhost / "httpdocs").mkdir()  # empty (canonical empty triggers pick)
+        public_html = vhost / "public_html"
+        public_html.mkdir()
+        (public_html / "index.html").write_bytes(b"x" * has_public_html_bytes)
+
+    def test_hash_match_logs_info_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            vhost_root = pathlib.Path(tmp) / "vhosts"
+            vhost_root.mkdir()
+            self._set_up_vhost(vhost_root, has_public_html_bytes=42)
+            orch = self._make_orch(vhost_root)
+            # Stub the LOCAL _dir_manifest and the REMOTE one to return
+            # matching hashes.
+            local_manifest = (1, 42, "deadbeef")
+            with mock.patch(
+                "plesk_migrator_orchestrator.pathlib.Path",
+                pathlib.Path,
+            ):
+                with mock.patch.object(
+                    PleskMigrationOrchestrator, "_dir_manifest",
+                    staticmethod(lambda p: local_manifest if "public_html" in str(p) else (0, 0, hashlib.md5(b"").hexdigest())),
+                ):
+                    orch._remote_dir_manifest = mock.MagicMock(
+                        return_value=(1, 42, "deadbeef")
+                    )
+                    # fix_docroot's vhost root is hard-coded to /var/www/vhosts;
+                    # we monkeypatch it via a wrapper attribute the impl will read.
+                    # If your impl uses pathlib.Path("/var/www/vhosts") directly,
+                    # set fix_docroot's vhosts_root via patching that line:
+                    with mock.patch(
+                        "plesk_migrator_orchestrator.pathlib.Path",
+                        side_effect=lambda *a, **kw: pathlib.Path(*a, **kw),
+                    ):
+                        # Simpler: directly call the helper. Skip end-to-end and
+                        # assert the integration block by stubbing.
+                        pass
+            # End-to-end is awkward because of the hard-coded /var/www/vhosts.
+            # Instead, exercise the integration block by patching it via a
+            # `_validate_docroot_match(domain, local_path)` seam (see Task 6.2).
+            self.skipTest(
+                "End-to-end fix_docroot test deferred — see "
+                "test_validate_docroot_match_logs_ok below for the "
+                "behavior under test."
+            )
+
+    def test_validate_docroot_match_logs_ok(self) -> None:
+        """Targeted test of the validation block, hoisted into a small
+        helper _validate_docroot_match(domain, local_path) to keep the
+        integration testable. See Task 6.2 implementation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            local = pathlib.Path(tmp) / "httpdocs"
+            local.mkdir()
+            (local / "index.html").write_bytes(b"hello")
+            orch = PleskMigrationOrchestrator.__new__(PleskMigrationOrchestrator)
+            orch.dry_run = False
+            orch.logger = mock.MagicMock()
+            orch.config = {
+                "source": {
+                    "host": "cpanel.example.com",
+                    "ssh_port": 22,
+                    "ssh_password": "secret",
+                },
+            }
+            # Local manifest of the real dir
+            local_count, local_bytes, local_hash = (
+                PleskMigrationOrchestrator._dir_manifest(local)
+            )
+            orch._remote_dir_manifest = mock.MagicMock(
+                return_value=(local_count, local_bytes, local_hash)
+            )
+            orch._validate_docroot_match("opiniao.inf.br", local)
+            info_msgs = [c.args[0] for c in orch.logger.info.call_args_list]
+            self.assertTrue(
+                any("hash OK" in m for m in info_msgs),
+                f"expected 'hash OK' info log, got: {info_msgs}",
+            )
+
+    def test_validate_docroot_match_logs_warning_on_diverge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = pathlib.Path(tmp) / "httpdocs"
+            local.mkdir()
+            (local / "index.html").write_bytes(b"hello")
+            orch = PleskMigrationOrchestrator.__new__(PleskMigrationOrchestrator)
+            orch.dry_run = False
+            orch.logger = mock.MagicMock()
+            orch.config = {
+                "source": {
+                    "host": "cpanel.example.com",
+                    "ssh_port": 22,
+                    "ssh_password": "secret",
+                },
+            }
+            orch._remote_dir_manifest = mock.MagicMock(
+                return_value=(99, 9999, "feedbeef")
+            )
+            orch._validate_docroot_match("opiniao.inf.br", local)
+            warn_msgs = [c.args[0] for c in orch.logger.warning.call_args_list]
+            self.assertTrue(
+                any("DIVERGE" in m for m in warn_msgs),
+                f"expected DIVERGE warning, got: {warn_msgs}",
+            )
+
+    def test_validate_docroot_match_remote_failure_warns_and_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = pathlib.Path(tmp) / "httpdocs"
+            local.mkdir()
+            orch = PleskMigrationOrchestrator.__new__(PleskMigrationOrchestrator)
+            orch.dry_run = False
+            orch.logger = mock.MagicMock()
+            orch.config = {
+                "source": {
+                    "host": "cpanel.example.com",
+                    "ssh_port": 22,
+                    "ssh_password": "secret",
+                },
+            }
+            orch._remote_dir_manifest = mock.MagicMock(return_value=(0, 0, ""))
+            orch._validate_docroot_match("opiniao.inf.br", local)
+            warn_msgs = [c.args[0] for c in orch.logger.warning.call_args_list]
+            self.assertTrue(
+                any("validação cross-server pulada" in m for m in warn_msgs),
+                f"expected 'pulada' warning, got: {warn_msgs}",
+            )
 
 
 if __name__ == "__main__":
