@@ -1798,16 +1798,20 @@ class PleskMigrationOrchestrator:
         )
 
     @staticmethod
-    def _dir_manifest(path: pathlib.Path) -> tuple[int, int, str]:
+    def _dir_manifest(path: pathlib.Path) -> tuple[int, int, str, str]:
         """Stat-only fingerprint of a directory tree.
 
-        Returns (file_count, total_bytes, md5_hex). md5_hex hashes
-        '\n'.join(sorted "relpath:size") — content bytes are NOT read,
-        so it is fast even on multi-GB web trees and stable across rsync
-        (mtime/atime ignored). Two paths with identical manifest_hash hold
-        the same files (by name + size). Missing path or stat errors yield
-        (0, 0, md5("")). followlinks=False to avoid infinite loops on
-        symlinked vhosts."""
+        Returns (file_count, total_bytes, md5_hex, body). md5_hex hashes
+        body which is '\n'.join(sorted "relpath:size") — content bytes
+        are NOT read, so it is fast even on multi-GB web trees and stable
+        across rsync (mtime/atime ignored). entries.sort() is applied
+        AFTER os.walk so order matches the remote `LC_ALL=C sort -u` —
+        Python str sort is bytewise (codepoint), identical to LC_ALL=C
+        sort. Two paths with identical manifest_hash hold the same files
+        (by name + size). The body is returned alongside so callers can
+        compute set-diff between local and remote on divergence. Missing
+        path or stat errors yield (0, 0, md5(""), ""). followlinks=False
+        avoids infinite loops on symlinked vhosts."""
         entries: list[str] = []
         count = 0
         total = 0
@@ -1825,8 +1829,9 @@ class PleskMigrationOrchestrator:
                     count += 1
                     total += st.st_size
         entries.sort()
-        digest = hashlib.md5("\n".join(entries).encode("utf-8")).hexdigest()
-        return count, total, digest
+        body = "\n".join(entries)
+        digest = hashlib.md5(body.encode("utf-8")).hexdigest()
+        return count, total, digest, body
 
     def _validate_docroot_match(
         self, domain: str, local_path: pathlib.Path,
@@ -1835,12 +1840,17 @@ class PleskMigrationOrchestrator:
         as www-root. Pure observation — divergence logs a warning, never
         raises. Empty remote manifest (SSH failed, sshpass missing, etc.)
         logs a 'pulada' warning so the operator notices but the pipeline
-        continues."""
+        continues. On hash divergence, writes a per-domain diff CSV at
+        <log_dir>/docroot-diff-<domain>.csv listing which files are only
+        on the cPanel source vs only on the Plesk destination — turning
+        the opaque 'DIVERGE' signal into an actionable per-file list."""
         cpanel_user = domain.split(".", 1)[0]  # best-effort default; cPanel
         # accounts are typically named after the first label or a truncation
         # — operators with exotic mappings can extend this later.
         remote_path = f"/home/{cpanel_user}/public_html"
-        src_count, src_bytes, src_hash = self._remote_dir_manifest(remote_path)
+        src_count, src_bytes, src_hash, src_body = self._remote_dir_manifest(
+            remote_path,
+        )
         if not src_hash:
             self.logger.warning(
                 "fix-docroot: %s — validação cross-server pulada "
@@ -1848,59 +1858,100 @@ class PleskMigrationOrchestrator:
                 domain, remote_path,
             )
             return
-        dst_count, dst_bytes, dst_hash = self._dir_manifest(local_path)
+        dst_count, dst_bytes, dst_hash, dst_body = self._dir_manifest(
+            local_path,
+        )
         if src_hash == dst_hash:
             self.logger.info(
                 "fix-docroot: %s — hash OK (%d arquivos, %d bytes, %s)",
                 domain, dst_count, dst_bytes, dst_hash[:8],
             )
             return
+        src_set = set(src_body.splitlines()) if src_body else set()
+        dst_set = set(dst_body.splitlines()) if dst_body else set()
+        only_src = sorted(src_set - dst_set)
+        only_dst = sorted(dst_set - src_set)
+        self._write_docroot_diff_csv(domain, only_src, only_dst)
         self.logger.warning(
             "fix-docroot: %s — hash DIVERGE "
-            "src(%d arq / %d B / %s) dst(%d arq / %d B / %s)",
+            "src(%d arq / %d B / %s) dst(%d arq / %d B / %s) — "
+            "%d arq só no src, %d só no dst — ver docroot-diff-%s.csv",
             domain, src_count, src_bytes, src_hash[:8],
             dst_count, dst_bytes, dst_hash[:8],
+            len(only_src), len(only_dst), domain,
         )
+
+    def _write_docroot_diff_csv(
+        self, domain: str, only_src: list[str], only_dst: list[str],
+    ) -> None:
+        """Persist per-domain diff between cPanel src and Plesk dst.
+
+        Format: timestamp,side,path,size (header + rows). side ∈ {src,dst}
+        identifies where the file lives (src=cPanel only; dst=Plesk only).
+        Each input line is the raw manifest entry "relpath:size" — we
+        rpartition on ':' to recover (path, size) even when paths contain
+        ':' chars (rsplit takes the LAST ':'). OSError is logged and
+        swallowed — diagnostic output is best-effort, must not break the
+        pipeline."""
+        path = self.log_dir / f"docroot-diff-{domain}.csv"
+        try:
+            with path.open("w", encoding="utf-8") as fh:
+                ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                fh.write("timestamp,side,path,size\n")
+                for line in only_src:
+                    p, _sep, sz = line.rpartition(":")
+                    fh.write(f"{ts},src,{p},{sz}\n")
+                for line in only_dst:
+                    p, _sep, sz = line.rpartition(":")
+                    fh.write(f"{ts},dst,{p},{sz}\n")
+        except OSError as exc:
+            self.logger.warning(
+                "fix-docroot: %s — falha gravando diff CSV: %s",
+                domain, exc,
+            )
 
     def _remote_dir_manifest(
         self, remote_path: str,
-    ) -> tuple[int, int, str]:
+    ) -> tuple[int, int, str, str]:
         """Cross-server analogue of _dir_manifest.
 
         Runs over SSH on the cPanel source host (host/port/password from
-        self.config["source"]). Pipeline:
+        self.config["source"]). LC_ALL=C forces bytewise collation on both
+        find (filename ordering) and sort (output ordering) so the manifest
+        order matches Python's `entries.sort()` (codepoint/bytewise) — without
+        LC_ALL=C, a locale like pt_BR.UTF-8 would produce locale-aware
+        collation that diverges on names with accents/special chars and
+        causes spurious hash mismatches.
 
-          find <path> -type f -printf '%P:%s\n' | sort -u > /tmp/m.$$
-          COUNT=$(wc -l < /tmp/m.$$)
-          TOTAL=$(awk -F: '{s+=$NF} END{print s+0}' /tmp/m.$$)
-          MD5=$(md5sum /tmp/m.$$ | awk '{print $1}')
-          # but md5sum hashes the file bytes — we want md5 over the
-          # joined-by-newlines body, identical to _dir_manifest. So we
-          # hash the file directly: md5sum < /tmp/m.$$ → that's the same
-          # because each entry is one line "p:s\n", joined by newlines.
-          # However _dir_manifest uses "\n".join (NO trailing \n). To
-          # match, strip the trailing newline server-side before md5sum.
+        Pipeline:
+          body=$(LC_ALL=C find <path> -type f -printf '%P:%s\n' \\
+                   | LC_ALL=C sort -u)
+          if [ -z "$body" ]; ...; else ... fi
+          echo "COUNT=$n"; echo "TOTAL=$b"; echo "MD5=$md5"
+          echo "---BODY---"; printf '%s' "$body"
 
-        Output format:
-          COUNT=<n>\nTOTAL=<b>\nMD5=<hex>\n
+        Output format (stdout): header lines (COUNT/TOTAL/MD5) terminated
+        by a literal '---BODY---' line, followed by the raw body (entries
+        joined by \\n, NO trailing \\n — matches _dir_manifest "\n".join).
+        Caller can split on '\\n---BODY---\\n' to recover body for set-diff.
 
-        Returns (0, 0, "") on any failure (ssh missing, sshpass missing,
-        non-zero rc, malformed output, dry_run). Never raises — caller
-        treats divergence as a warning only."""
+        Returns (0, 0, "", "") on any failure (ssh missing, sshpass
+        missing, non-zero rc, malformed output, dry_run). Never raises —
+        caller treats divergence as a warning only."""
         if self.dry_run:
-            return 0, 0, ""
+            return 0, 0, "", ""
         src = self.config.get("source") or {}
         host = src.get("host")
         password = src.get("ssh_password")
         port = int(src.get("ssh_port", 22))
         if not host or not password:
-            return 0, 0, ""
+            return 0, 0, "", ""
         # Shell pipeline. `printf '%s' "$body"` strips the trailing newline
         # so md5 matches _dir_manifest's "\n".join semantics exactly.
         remote_cmd = (
             f"set -e; "
-            f"body=$(find {shlex.quote(remote_path)} -type f "
-            f"-printf '%P:%s\\n' 2>/dev/null | sort -u); "
+            f"body=$(LC_ALL=C find {shlex.quote(remote_path)} -type f "
+            f"-printf '%P:%s\\n' 2>/dev/null | LC_ALL=C sort -u); "
             f"if [ -z \"$body\" ]; then "
             f"count=0; total=0; md5=; "
             f"else "
@@ -1909,7 +1960,9 @@ class PleskMigrationOrchestrator:
             f"END{{print s+0}}'); "
             f"md5=$(printf '%s' \"$body\" | md5sum | awk '{{print $1}}'); "
             f"fi; "
-            f"echo \"COUNT=$count\"; echo \"TOTAL=$total\"; echo \"MD5=$md5\""
+            f"echo \"COUNT=$count\"; echo \"TOTAL=$total\"; "
+            f"echo \"MD5=$md5\"; echo \"---BODY---\"; "
+            f"printf '%s' \"$body\""
         )
         argv = [
             "sshpass", "-e",
@@ -1932,31 +1985,37 @@ class PleskMigrationOrchestrator:
             self.logger.warning(
                 "_remote_dir_manifest: ssh falhou: %s", exc,
             )
-            return 0, 0, ""
+            return 0, 0, "", ""
         if proc.returncode != 0:
             self.logger.warning(
                 "_remote_dir_manifest: rc=%d stderr=%s",
                 proc.returncode, proc.stderr.strip()[:200],
             )
-            return 0, 0, ""
+            return 0, 0, "", ""
+        # Split header from body at sentinel. Body uses \n separators
+        # (no trailing newline) so we cannot just splitlines() the whole
+        # stdout — that would chunk body into individual entry lines.
+        parts = proc.stdout.split("\n---BODY---\n", 1)
+        header = parts[0]
+        body = parts[1] if len(parts) == 2 else ""
         count = total = 0
         digest = ""
-        for line in proc.stdout.splitlines():
+        for line in header.splitlines():
             if line.startswith("COUNT="):
                 try:
                     count = int(line.split("=", 1)[1])
                 except ValueError:
-                    return 0, 0, ""
+                    return 0, 0, "", ""
             elif line.startswith("TOTAL="):
                 try:
                     total = int(line.split("=", 1)[1])
                 except ValueError:
-                    return 0, 0, ""
+                    return 0, 0, "", ""
             elif line.startswith("MD5="):
                 digest = line.split("=", 1)[1].strip()
         if not digest:
-            return 0, 0, ""
-        return count, total, digest
+            return 0, 0, "", ""
+        return count, total, digest, body
 
     @staticmethod
     def _pick_docroot(
@@ -2040,7 +2099,11 @@ class PleskMigrationOrchestrator:
 
             manifests: dict[str, tuple[int, int, str]] = {}
             for name in DOCROOT_CANDIDATES:
-                manifests[name] = self._dir_manifest(vhost / name)
+                # _dir_manifest now returns (count, total, digest, body);
+                # _pick_docroot only needs the first three — discard body
+                # to keep the manifests dict lean (body can be ~MB per dir).
+                c, b, h, _body = self._dir_manifest(vhost / name)
+                manifests[name] = (c, b, h)
 
             scan_summary = ", ".join(
                 f"{n}={c}f/{b}B/{h[:8]}"
