@@ -159,6 +159,7 @@ PHASES_ORDER = [
     "copy-mail",
     "fix-mailpath",
     "check-mail-passwords",
+    "fix-ftp-passwords",
     "fix-mail-quota",
     "fix-ftp-renames",
     "fix-dns-conflicts",
@@ -371,6 +372,7 @@ class PleskMigrationOrchestrator:
         for key in (
             "web_content", "mail_content", "db_content",
             "fix_docroot", "fix_mailpath", "check_mail_passwords",
+            "fix_ftp_passwords",
             "sanitize_list", "fix_limits", "retransfer_failed",
             "fix_mail_quota", "fix_ftp_renames", "fix_dns_conflicts",
             "fix_owner",
@@ -381,7 +383,7 @@ class PleskMigrationOrchestrator:
             "dry_run", "skip_install", "force_regenerate",
             "cleanup_config", "resume",
             "apply_owner_fix", "apply_dns_cleanup", "apply_mailpath_fix",
-            "reset_mail_passwords", "rename_reserved_subdomains",
+            "reset_mail_passwords", "reset_ftp_passwords", "rename_reserved_subdomains",
         ):
             if key in behavior and not isinstance(behavior[key], bool):
                 raise ValidationError(f"behavior.{key} deve ser bool")
@@ -3113,6 +3115,8 @@ class PleskMigrationOrchestrator:
         skip_fix_mailpath: bool = False,
         skip_check_mail_passwords: bool = False,
         reset_mail_passwords: bool = False,
+        skip_fix_ftp_passwords: bool = False,
+        reset_ftp_passwords: bool = False,
         skip_sanitize_list: bool = False,
         rename_reserved_subdomains: bool = False,
         skip_fix_limits: bool = False,
@@ -3153,6 +3157,14 @@ class PleskMigrationOrchestrator:
         reset_mail_passwords = (
             reset_mail_passwords
             or (behavior.get("reset_mail_passwords", False))
+        )
+        skip_fix_ftp_passwords = (
+            skip_fix_ftp_passwords
+            or behavior_skip.get("fix_ftp_passwords", False)
+        )
+        reset_ftp_passwords = (
+            reset_ftp_passwords
+            or (behavior.get("reset_ftp_passwords", False))
         )
         skip_sanitize_list = (
             skip_sanitize_list or behavior_skip.get("sanitize_list", False)
@@ -3248,6 +3260,9 @@ class PleskMigrationOrchestrator:
             ("check-mail-passwords",
              lambda: self.check_mail_passwords(reset=reset_mail_passwords),
              not skip_check_mail_passwords),
+            ("fix-ftp-passwords",
+             lambda: self.fix_ftp_passwords(reset=reset_ftp_passwords),
+             not skip_fix_ftp_passwords),
             ("fix-mail-quota", self.fix_mail_quota, not skip_fix_mail_quota),
             ("fix-ftp-renames", self.fix_ftp_renames, not skip_fix_ftp_renames),
             ("fix-dns-conflicts",
@@ -3628,6 +3643,15 @@ def _build_parser() -> argparse.ArgumentParser:
                              "cada conta sem senha e grava CSV chmod 600 em "
                              "<log_dir>/mail-password-reset.csv. Distribuir "
                              "via canal seguro fora-de-banda.")
+    parser.add_argument("--skip-fix-ftp-passwords", action="store_true",
+                        help="Pula auditoria/reset de senhas de sub-FTP users "
+                             "(fase fix-ftp-passwords)")
+    parser.add_argument("--reset-ftp-passwords", action="store_true",
+                        help="Em fix-ftp-passwords, gera senha nova "
+                             "(urlsafe(16)) para cada FTP user listado e "
+                             "grava CSV chmod 600 em "
+                             "<log_dir>/ftp-password-reset.csv. Distribuir "
+                             "via canal seguro fora-de-banda.")
     parser.add_argument("--skip-sanitize-list", action="store_true",
                         help="Pula auditoria de subdomains reservados Plesk "
                              "(fase sanitize-list)")
@@ -3768,6 +3792,8 @@ def main(argv: list[str] | None = None) -> int:
             skip_fix_mailpath=args.skip_fix_mailpath,
             skip_check_mail_passwords=args.skip_check_mail_passwords,
             reset_mail_passwords=args.reset_mail_passwords,
+            skip_fix_ftp_passwords=args.skip_fix_ftp_passwords,
+            reset_ftp_passwords=args.reset_ftp_passwords,
             skip_sanitize_list=args.skip_sanitize_list,
             rename_reserved_subdomains=args.rename_reserved_subdomains,
             skip_fix_limits=args.skip_fix_limits,
