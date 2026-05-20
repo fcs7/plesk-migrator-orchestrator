@@ -19,7 +19,7 @@ from plesk_migrator_orchestrator import PleskMigrationOrchestrator
 class DirManifestTests(unittest.TestCase):
     def test_empty_directory_returns_zero_counts_and_empty_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            count, total, digest = PleskMigrationOrchestrator._dir_manifest(
+            count, total, digest, _body = PleskMigrationOrchestrator._dir_manifest(
                 pathlib.Path(tmp)
             )
             self.assertEqual(count, 0)
@@ -34,7 +34,7 @@ class DirManifestTests(unittest.TestCase):
             (root / "sub" / "a.txt").write_text("xy")          # 2 bytes
             (root / "sub" / "b.txt").write_bytes(b"\x00" * 10) # 10 bytes
 
-            count, total, digest = PleskMigrationOrchestrator._dir_manifest(root)
+            count, total, digest, _body = PleskMigrationOrchestrator._dir_manifest(root)
 
             self.assertEqual(count, 3)
             self.assertEqual(total, 17)
@@ -50,8 +50,8 @@ class DirManifestTests(unittest.TestCase):
                 (d / "index.php").write_text("<?php echo 1;")  # 13 bytes
                 (d / "wp-config.php").write_text("XXXXX")      # 5 bytes
 
-            _, _, digest_a = PleskMigrationOrchestrator._dir_manifest(a)
-            _, _, digest_b = PleskMigrationOrchestrator._dir_manifest(b)
+            _, _, digest_a, _ = PleskMigrationOrchestrator._dir_manifest(a)
+            _, _, digest_b, _ = PleskMigrationOrchestrator._dir_manifest(b)
             self.assertEqual(digest_a, digest_b)
 
     def test_different_size_breaks_manifest_hash(self) -> None:
@@ -63,20 +63,20 @@ class DirManifestTests(unittest.TestCase):
             (a / "f.txt").write_text("hello")
             (b / "f.txt").write_text("helloworld")  # different size
 
-            _, _, digest_a = PleskMigrationOrchestrator._dir_manifest(a)
-            _, _, digest_b = PleskMigrationOrchestrator._dir_manifest(b)
+            _, _, digest_a, _ = PleskMigrationOrchestrator._dir_manifest(a)
+            _, _, digest_b, _ = PleskMigrationOrchestrator._dir_manifest(b)
             self.assertNotEqual(digest_a, digest_b)
 
     def test_missing_path_returns_zero(self) -> None:
         nonexistent = pathlib.Path("/nonexistent/path/that/does/not/exist/xyz")
-        count, total, digest = PleskMigrationOrchestrator._dir_manifest(nonexistent)
+        count, total, digest, _body = PleskMigrationOrchestrator._dir_manifest(nonexistent)
         self.assertEqual(count, 0)
         self.assertEqual(total, 0)
         self.assertEqual(digest, hashlib.md5(b"").hexdigest())
 
     def test_file_path_not_dir_returns_zero(self) -> None:
         with tempfile.NamedTemporaryFile() as tmp:
-            count, total, digest = PleskMigrationOrchestrator._dir_manifest(
+            count, total, digest, _body = PleskMigrationOrchestrator._dir_manifest(
                 pathlib.Path(tmp.name)
             )
             self.assertEqual(count, 0)
@@ -98,7 +98,7 @@ class DirManifestTests(unittest.TestCase):
             (root / "aaa").mkdir()
             (root / "aaa" / "file.php").write_text("xxx")  # 3 bytes
 
-            count, total, digest = PleskMigrationOrchestrator._dir_manifest(
+            count, total, digest, _body = PleskMigrationOrchestrator._dir_manifest(
                 root
             )
             expected_body = "\n".join(sorted([
