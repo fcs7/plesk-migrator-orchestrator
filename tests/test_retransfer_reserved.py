@@ -212,6 +212,43 @@ class SubscriptionOnlyReservedFailuresTests(unittest.TestCase):
                 orch._subscription_only_reserved_failures("x.com", session)
             )
 
+    def test_mixed_case_hostname_classified_as_reserved(self) -> None:
+        """Hosts in accounts_report_tree.* may carry cPanel-style mixed-case
+        (e.g. 'Webmail.OPINIAO.INF.BR'). Classifier must lowercase both
+        sides before comparison — otherwise reserved-subdomain failures
+        slip through and retransfer_failed raises spuriously."""
+        orch = self._make_orch()
+        orch._domain_exists_in_plesk = mock.MagicMock(return_value=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp)
+            (session / "accounts_report_tree.2026.05.20.17.00.00").write_text(
+                "sites of subscription were not created - they do not exist"
+                " on target panel: 'Webmail.OPINIAO.INF.BR'\n"
+            )
+            self.assertTrue(
+                orch._subscription_only_reserved_failures(
+                    "opiniao.inf.br", session
+                )
+            )
+
+    def test_mixed_case_domain_input_matches_lowercase_hosts(self) -> None:
+        """Domain argument may arrive mixed-case from callers parsing
+        external state (failed-subscriptions, migration-list). Classifier
+        must lowercase the domain too."""
+        orch = self._make_orch()
+        orch._domain_exists_in_plesk = mock.MagicMock(return_value=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp)
+            (session / "accounts_report_tree.2026.05.20.17.00.00").write_text(
+                "sites of subscription were not created - they do not exist"
+                " on target panel: 'webmail.opiniao.inf.br'\n"
+            )
+            self.assertTrue(
+                orch._subscription_only_reserved_failures(
+                    "Opiniao.Inf.Br", session
+                )
+            )
+
     def test_per_domain_filter_isolates_cross_domain_failures(self) -> None:
         """When a shared report mentions a reserved subdomain for domain A
         *and* a non-reserved failure for domain B, the classifier for A
