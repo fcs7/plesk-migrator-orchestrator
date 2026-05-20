@@ -76,6 +76,7 @@ behavior:
     retransfer_failed: false    # --skip-retransfer-failed
     fix_mail_quota: false       # --skip-fix-mail-quota
     fix_ftp_renames: false      # --skip-fix-ftp-renames
+    fix_ftp_passwords: false    # --skip-fix-ftp-passwords
     fix_dns_conflicts: false    # --skip-fix-dns-conflicts
     fix_owner: false            # --skip-fix-owner
   # Opt-ins (default OFF — efeito sobre estado/cliente)
@@ -84,3 +85,4 @@ behavior:
   apply_dns_cleanup: false           # --apply-dns-cleanup
   apply_mailpath_fix: false          # --apply-mailpath-fix
   reset_mail_passwords: false        # --reset-mail-passwords
+  reset_ftp_passwords: false         # --reset-ftp-passwords

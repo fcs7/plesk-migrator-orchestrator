@@ -158,6 +158,7 @@ PHASES_ORDER = [
     "copy-mail",
     "fix-mailpath",
     "check-mail-passwords",
+    "fix-ftp-passwords",
     "fix-mail-quota",
     "fix-ftp-renames",
     "fix-dns-conflicts",
@@ -370,6 +371,7 @@ class PleskMigrationOrchestrator:
         for key in (
             "web_content", "mail_content", "db_content",
             "fix_docroot", "fix_mailpath", "check_mail_passwords",
+            "fix_ftp_passwords",
             "sanitize_list", "fix_limits", "retransfer_failed",
             "fix_mail_quota", "fix_ftp_renames", "fix_dns_conflicts",
             "fix_owner",
@@ -380,7 +382,7 @@ class PleskMigrationOrchestrator:
             "dry_run", "skip_install", "force_regenerate",
             "cleanup_config", "resume",
             "apply_owner_fix", "apply_dns_cleanup", "apply_mailpath_fix",
-            "reset_mail_passwords", "rename_reserved_subdomains",
+            "reset_mail_passwords", "reset_ftp_passwords", "rename_reserved_subdomains",
         ):
             if key in behavior and not isinstance(behavior[key], bool):
                 raise ValidationError(f"behavior.{key} deve ser bool")
@@ -1605,6 +1607,40 @@ class PleskMigrationOrchestrator:
                 labels.add(first)
         return labels
 
+    @staticmethod
+    def _parse_ftp_renames_from_report(
+        session_dir: pathlib.Path,
+    ) -> list[tuple[str, str, str]]:
+        """List of (original_login, new_login, domain) parsed from the
+        newest accounts_report_tree.* in `session_dir`. `domain` is the
+        suffix after `@` in original_login (empty string when absent).
+        Missing dir, no report, or unreadable files yield []."""
+        if not session_dir.is_dir():
+            return []
+        reports = sorted(
+            p for p in session_dir.glob("accounts_report_tree.*")
+            if p.is_file() and ".json" not in p.suffixes
+            and ".bak" not in p.suffixes
+        )
+        if not reports:
+            return []
+        try:
+            content = reports[-1].read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            return []
+        rename_re = re.compile(
+            r"Login of FTP user '([^']+)' does not conform to Plesk rules\. "
+            r"It was changed to '([^']+)'",
+            re.IGNORECASE,
+        )
+        out: list[tuple[str, str, str]] = []
+        for original, new in rename_re.findall(content):
+            domain = original.split("@", 1)[1] if "@" in original else ""
+            out.append((original, new, domain))
+        return out
+
     def _domain_exists_in_plesk(self, domain: str) -> bool:
         """True iff `domain` has a row in psa.domains. Uses `plesk db -Nse`
         via _run_plesk_db. In dry_run returns True (don't block recovery
@@ -1647,9 +1683,10 @@ class PleskMigrationOrchestrator:
         succeed (Plesk reserves these subdomain names) but whose parent
         subscription is already operational."""
         hosts = self._parse_reserved_subdomain_failure_hosts(session_dir)
+        dom_lc = domain.lower()
         own = [
             h for h in hosts
-            if h == domain or h.endswith("." + domain)
+            if h.lower() == dom_lc or h.lower().endswith("." + dom_lc)
         ]
         if not own:
             return False
@@ -1844,9 +1881,13 @@ class PleskMigrationOrchestrator:
         <log_dir>/docroot-diff-<domain>.csv listing which files are only
         on the cPanel source vs only on the Plesk destination — turning
         the opaque 'DIVERGE' signal into an actionable per-file list."""
-        cpanel_user = domain.split(".", 1)[0]  # best-effort default; cPanel
-        # accounts are typically named after the first label or a truncation
-        # — operators with exotic mappings can extend this later.
+        cpanel_user = (
+            self._resolve_cpanel_user(domain)
+            or domain.split(".", 1)[0]
+        )
+        # /etc/userdomains is the canonical WHM mapping. Heuristic first-label
+        # remains as fallback for hosts without /etc/userdomains access (rare)
+        # or domains genuinely matching the heuristic.
         remote_path = f"/home/{cpanel_user}/public_html"
         src_count, src_bytes, src_hash, src_body = self._remote_dir_manifest(
             remote_path,
@@ -2025,6 +2066,73 @@ class PleskMigrationOrchestrator:
             return 0, 0, "", ""
         return count, total, digest, body
 
+    def _resolve_cpanel_user(self, domain: str) -> str | None:
+        """Resolve real cPanel username for `domain` via WHM canonical
+        mapping `/etc/userdomains` (one line per domain: `<dom>: <user>`).
+
+        Returns the username (stripped) or None on:
+          - SSH failure (sshpass missing, host unreachable, rc != 0)
+          - missing/empty grep result (domain not in /etc/userdomains)
+          - dry_run mode (avoids networking in tests)
+
+        Results cached per session in `self._cpanel_user_cache` keyed by
+        domain. Empty result also cached (None) to avoid retrying a
+        failed lookup mid-pipeline.
+
+        Caller should `or domain.split('.', 1)[0]` to fall back to the
+        legacy first-label heuristic on None (backward compatibility)."""
+        if self.dry_run:
+            return None
+        cache = getattr(self, "_cpanel_user_cache", None)
+        if cache is None:
+            cache = {}
+            self._cpanel_user_cache = cache
+        if domain in cache:
+            return cache[domain]
+        src = self.config.get("source") or {}
+        host = src.get("host")
+        password = src.get("ssh_password")
+        port = int(src.get("ssh_port", 22))
+        if not host or not password:
+            cache[domain] = None
+            return None
+        remote_cmd = (
+            f"grep -E '^{shlex.quote(domain)}:[[:space:]]' "
+            f"/etc/userdomains | awk '{{print $2}}'"
+        )
+        argv = [
+            "sshpass", "-e",
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=15",
+            "-o", "BatchMode=no",
+            "-p", str(port),
+            f"root@{host}",
+            remote_cmd,
+        ]
+        env = {**os.environ, "SSHPASS": str(password)}
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True,
+                timeout=30, check=False, env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+            self.logger.debug(
+                "_resolve_cpanel_user: ssh falhou (%s): %s", domain, exc,
+            )
+            cache[domain] = None
+            return None
+        if proc.returncode != 0:
+            self.logger.debug(
+                "_resolve_cpanel_user: rc=%d para %s", proc.returncode, domain,
+            )
+            cache[domain] = None
+            return None
+        user = proc.stdout.strip()
+        cache[domain] = user if user else None
+        return cache[domain]
+
     @staticmethod
     def _pick_docroot(
         manifests: dict[str, tuple[int, int, str]],
@@ -2145,14 +2253,14 @@ class PleskMigrationOrchestrator:
             )
             if self.dry_run:
                 self.logger.info(
-                    "[DRY-RUN] %s bin subscription -u %s -www-root %s",
-                    self.plesk_bin, domain, target,
+                    "[DRY-RUN] %s bin subscription -u %s -www-root %s (abs=%s)",
+                    self.plesk_bin, domain, choice, target,
                 )
                 continue
 
             self._run(
                 [str(self.plesk_bin), "bin", "subscription",
-                 "-u", domain, "-www-root", str(target)],
+                 "-u", domain, "-www-root", choice],
                 timeout=TIMEOUT_FIX_DOCROOT,
                 log_to=report,
             )
@@ -2420,6 +2528,166 @@ class PleskMigrationOrchestrator:
             "check_mail_passwords: %d/%d senha(s) resetada(s). CSV: %s "
             "(distribua via canal seguro fora-de-banda).",
             reset_count, len(addresses), csv_path,
+        )
+
+    def fix_ftp_passwords(self, *, reset: bool = False) -> None:
+        """Reseta senhas dos FTP subaccounts renomeados (user@dom → user_dom)
+        durante import cPanel→Plesk. Hashes crypt-MD5 cPanel falham contra
+        Plesk Linux SHA-512 → login 530.
+
+        Fonte autoritativa: accounts_report_tree.* da sessão (regex
+        "Login of FTP user 'X' does not conform"). Cada `new_login`
+        retornado é uma subconta FTP cPanel-importada cujo hash não funciona.
+        Reuso do helper compartilhado com fix_ftp_renames.
+
+        Default (reset=False): audit-only, escreve ftp-password-status.csv.
+        reset=True: gera senha secrets.token_urlsafe(16) por login, chama
+        `plesk bin ftpuser -u <new_login> -passwd <pwd>`, escreve
+        ftp-password-reset.csv chmod 600, adiciona senhas a sensitive_values.
+
+        NÃO toca o subscription main user (criado novo pelo Plesk, hash OK
+        nativo). Para resetar main FTP manualmente:
+        `plesk bin subscription --update <dom> -passwd <pwd>` (também
+        rotaciona SSH/painel — fora de escopo aqui)."""
+        self.logger.info("Fase: fix_ftp_passwords (reset=%s)", reset)
+        if not self.plesk_bin:
+            self.logger.warning(
+                "fix_ftp_passwords: binário 'plesk' não localizado — skip"
+            )
+            return
+
+        session_dir = self.sessions_dir / self.session_name
+        renames = self._parse_ftp_renames_from_report(session_dir)
+        if not renames:
+            self.logger.info(
+                "fix_ftp_passwords: 0 FTP renames em "
+                "accounts_report_tree.* — skip"
+            )
+            return
+
+        migrated = {d.lower() for d in self._load_migrated_domains()}
+
+        targets: list[tuple[str, str]] = []  # (new_login, domain)
+        seen: set[str] = set()
+        for _original, new, domain in renames:
+            dom_lc = domain.lower()
+            if migrated and dom_lc and dom_lc not in migrated:
+                continue
+            if new in seen:
+                continue
+            seen.add(new)
+            targets.append((new, dom_lc))
+
+        if not targets:
+            self.logger.info(
+                "fix_ftp_passwords: 0 logins renomeados pertencem aos "
+                "domínios migrados — skip"
+            )
+            return
+
+        self.logger.warning(
+            "fix_ftp_passwords: %d FTP subaccount(s) com hash cPanel.",
+            len(targets),
+        )
+        for login, dom in targets[:20]:
+            self.logger.warning("  user: %s (%s)", login, dom)
+        if len(targets) > 20:
+            self.logger.warning(
+                "  ... e mais %d subaccount(s).", len(targets) - 20
+            )
+
+        if self.dry_run:
+            self.logger.info(
+                "[DRY-RUN] %s bin ftpuser -u <login> -passwd *** "
+                "(%d login(s))", self.plesk_bin, len(targets),
+            )
+            return
+
+        if not reset:
+            self.logger.warning(
+                "fix_ftp_passwords: rode com --reset-ftp-passwords para "
+                "gerar senhas novas (CSV em %s/ftp-password-reset.csv).",
+                self.log_dir,
+            )
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = self.log_dir / "ftp-password-status.csv"
+            try:
+                with csv_path.open("w", encoding="utf-8") as fh:
+                    fh.write("timestamp,login,domain\n")
+                    ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                    for login, dom in targets:
+                        fh.write(f"{ts},{login},{dom}\n")
+            except OSError as exc:
+                self.logger.error(
+                    "fix_ftp_passwords: erro escrevendo %s: %s",
+                    csv_path, exc,
+                )
+            return
+
+        # Reset mode
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = self.log_dir / "ftp-password-reset.csv"
+        new_file = not csv_path.exists()
+        try:
+            csv_path.touch(mode=0o600, exist_ok=True)
+            os.chmod(csv_path, 0o600)
+        except OSError as exc:
+            raise PhaseExecutionError(
+                f"fix_ftp_passwords: não consegui criar {csv_path}: {exc}"
+            ) from exc
+
+        reset_count = 0
+        with csv_path.open("a", encoding="utf-8") as fh:
+            if new_file:
+                fh.write("timestamp,login,domain,new_password\n")
+            for login, dom in targets:
+                while True:
+                    new_pwd = secrets.token_urlsafe(16)
+                    if new_pwd and new_pwd[0] not in "-_":
+                        break
+                self.sensitive_values.append(new_pwd)
+                # CLI: plesk bin ftpsubaccount (NOT ftpuser — last não existe
+                # nesta build). Senha via env PSA_PASSWORD (recomendação Plesk:
+                # evita leak via /proc/<pid>/cmdline — mesmo padrão sshpass -e).
+                cmd = [
+                    str(self.plesk_bin), "bin", "ftpsubaccount",
+                    "--update", login, "-passwd", "",
+                ]
+                if dom:
+                    cmd.extend(["-domain", dom])
+                self.logger.info("$ %s (PSA_PASSWORD=***)", " ".join(cmd))
+                env = dict(os.environ)
+                env["PSA_PASSWORD"] = new_pwd
+                try:
+                    proc = subprocess.run(
+                        cmd, env=env, capture_output=True, text=True,
+                        timeout=60, check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    self.logger.error(
+                        "fix_ftp_passwords: falha resetando %s: %s",
+                        login, exc,
+                    )
+                    continue
+                if proc.returncode != 0:
+                    self.logger.error(
+                        "fix_ftp_passwords: ftpsubaccount rc=%d para %s: %s",
+                        proc.returncode, login,
+                        proc.stderr.strip()[:200] or proc.stdout.strip()[:200],
+                    )
+                    continue
+                ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                fh.write(f"{ts},{login},{dom},{new_pwd}\n")
+                reset_count += 1
+
+        try:
+            os.chmod(csv_path, 0o600)
+        except OSError:
+            pass
+        self.logger.warning(
+            "fix_ftp_passwords: %d/%d senha(s) resetada(s). CSV: %s "
+            "(distribua via canal seguro fora-de-banda).",
+            reset_count, len(targets), csv_path,
         )
 
     def fix_mail_quota(self) -> None:
@@ -2883,6 +3151,8 @@ class PleskMigrationOrchestrator:
         skip_fix_mailpath: bool = False,
         skip_check_mail_passwords: bool = False,
         reset_mail_passwords: bool = False,
+        skip_fix_ftp_passwords: bool = False,
+        reset_ftp_passwords: bool = False,
         skip_sanitize_list: bool = False,
         rename_reserved_subdomains: bool = False,
         skip_fix_limits: bool = False,
@@ -2923,6 +3193,14 @@ class PleskMigrationOrchestrator:
         reset_mail_passwords = (
             reset_mail_passwords
             or (behavior.get("reset_mail_passwords", False))
+        )
+        skip_fix_ftp_passwords = (
+            skip_fix_ftp_passwords
+            or behavior_skip.get("fix_ftp_passwords", False)
+        )
+        reset_ftp_passwords = (
+            reset_ftp_passwords
+            or (behavior.get("reset_ftp_passwords", False))
         )
         skip_sanitize_list = (
             skip_sanitize_list or behavior_skip.get("sanitize_list", False)
@@ -3018,6 +3296,9 @@ class PleskMigrationOrchestrator:
             ("check-mail-passwords",
              lambda: self.check_mail_passwords(reset=reset_mail_passwords),
              not skip_check_mail_passwords),
+            ("fix-ftp-passwords",
+             lambda: self.fix_ftp_passwords(reset=reset_ftp_passwords),
+             not skip_fix_ftp_passwords),
             ("fix-mail-quota", self.fix_mail_quota, not skip_fix_mail_quota),
             ("fix-ftp-renames", self.fix_ftp_renames, not skip_fix_ftp_renames),
             ("fix-dns-conflicts",
@@ -3398,6 +3679,15 @@ def _build_parser() -> argparse.ArgumentParser:
                              "cada conta sem senha e grava CSV chmod 600 em "
                              "<log_dir>/mail-password-reset.csv. Distribuir "
                              "via canal seguro fora-de-banda.")
+    parser.add_argument("--skip-fix-ftp-passwords", action="store_true",
+                        help="Pula auditoria/reset de senhas de sub-FTP users "
+                             "(fase fix-ftp-passwords)")
+    parser.add_argument("--reset-ftp-passwords", action="store_true",
+                        help="Em fix-ftp-passwords, gera senha nova "
+                             "(urlsafe(16)) para cada FTP user listado e "
+                             "grava CSV chmod 600 em "
+                             "<log_dir>/ftp-password-reset.csv. Distribuir "
+                             "via canal seguro fora-de-banda.")
     parser.add_argument("--skip-sanitize-list", action="store_true",
                         help="Pula auditoria de subdomains reservados Plesk "
                              "(fase sanitize-list)")
@@ -3538,6 +3828,8 @@ def main(argv: list[str] | None = None) -> int:
             skip_fix_mailpath=args.skip_fix_mailpath,
             skip_check_mail_passwords=args.skip_check_mail_passwords,
             reset_mail_passwords=args.reset_mail_passwords,
+            skip_fix_ftp_passwords=args.skip_fix_ftp_passwords,
+            reset_ftp_passwords=args.reset_ftp_passwords,
             skip_sanitize_list=args.skip_sanitize_list,
             rename_reserved_subdomains=args.rename_reserved_subdomains,
             skip_fix_limits=args.skip_fix_limits,
