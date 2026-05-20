@@ -87,6 +87,7 @@ TIMEOUT_TEST_ALL = 7200        # 2 h
 TIMEOUT_FIX_DOCROOT = 600      # 10 min — apenas chamadas `plesk bin subscription`
 TIMEOUT_FIX_MAILPATH = 600     # 10 min — auditoria de Maildir paths
 TIMEOUT_CHECK_MAIL_PASSWORDS = 300  # 5 min — query `plesk db` + reset opcional
+TIMEOUT_FIX_FTP_PASSWORDS = 300    # 5 min — query sys_users + reset opcional via ftpuser
 TIMEOUT_FIX_LIMITS = 600       # 10 min — UPDATE Limits + `plesk repair db`
 TIMEOUT_RETRANSFER = 14400     # 4 h — re-roda transfer-accounts pra failed
 TIMEOUT_FIX_MAIL_QUOTA = 300   # 5 min — UPDATE mail.mbox_quota
@@ -2491,6 +2492,160 @@ class PleskMigrationOrchestrator:
             "check_mail_passwords: %d/%d senha(s) resetada(s). CSV: %s "
             "(distribua via canal seguro fora-de-banda).",
             reset_count, len(addresses), csv_path,
+        )
+
+    def fix_ftp_passwords(self, *, reset: bool = False) -> None:
+        """Audita FTP users (sys_users em Plesk) cujas senhas vieram do cPanel com
+        hashes crypt-MD5 incompatíveis. Plesk Linux espera SHA-512 → login falha (530).
+        Espelha contrato de check_mail_passwords:
+        - Default (reset=False): audit-only, escreve ftp-password-status.csv
+        - reset=True: gera senha secrets.token_urlsafe(16) por user, chama
+          `plesk bin ftpuser -u <login> -passwd <pwd>`, escreve
+          ftp-password-reset.csv chmod 600, adiciona senhas a sensitive_values."""
+        self.logger.info("Fase: fix_ftp_passwords (reset=%s)", reset)
+        if not self.plesk_bin:
+            self.logger.warning(
+                "fix_ftp_passwords: binário 'plesk' não localizado — skip"
+            )
+            return
+
+        # SQL: lista todos sys_users vinculados a domínios migrados.
+        # sys_users pode ser subscription owner (hosting.sys_user_id) ou additional
+        # FTP user. Query agrupa por domínio usando DISTINCT para evitar duplicatas.
+        # Preferência: usar logins diretamente de sys_users.login e mapear via
+        # hosting/domains quando possível, fallback para logins simples.
+        domains_list = self._load_migrated_domains()
+        if not domains_list:
+            self.logger.info("fix_ftp_passwords: 0 domínios migrados — skip")
+            return
+
+        # Escapar cada domínio para SQL IN clause
+        escaped_domains = ", ".join(
+            f"'{self._sql_escape(d)}'" for d in domains_list
+        )
+
+        sql = (
+            f"SELECT DISTINCT su.login, COALESCE(d.name, '') AS domain "
+            f"FROM sys_users su "
+            f"JOIN hosting h ON h.sys_user_id=su.id OR su.login LIKE CONCAT('%\\_', "
+            f"SUBSTRING_INDEX(d.name, '.', 1), '%') "
+            f"JOIN domains d ON d.id=h.dom_id "
+            f"WHERE d.name IN ({escaped_domains}) "
+            f"ORDER BY d.name, su.login;"
+        )
+
+        if self.dry_run:
+            self.logger.info(
+                "[DRY-RUN] %s db -Nse \"%s\"", self.plesk_bin, sql.replace('"', '\\"')
+            )
+            return
+
+        try:
+            proc = subprocess.run(
+                [str(self.plesk_bin), "db", "-Nse", sql],
+                capture_output=True, text=True,
+                timeout=TIMEOUT_FIX_FTP_PASSWORDS, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise PhaseExecutionError(
+                f"fix_ftp_passwords: falha chamando `plesk db`: {exc}"
+            ) from exc
+        if proc.returncode != 0:
+            raise PhaseExecutionError(
+                f"fix_ftp_passwords: plesk db rc={proc.returncode} "
+                f"stderr={proc.stderr.strip()[:300]}"
+            )
+
+        # Parse output: "login\tdomain" (tab-separated)
+        users = []
+        for ln in proc.stdout.splitlines():
+            ln = ln.strip()
+            if not ln or "\t" not in ln:
+                continue
+            parts = ln.split("\t", 1)
+            if len(parts) == 2:
+                login, domain = parts
+                users.append((login, domain))
+
+        if not users:
+            self.logger.info("fix_ftp_passwords: 0 FTP users encontrados.")
+            return
+
+        self.logger.warning(
+            "fix_ftp_passwords: %d FTP user(s) encontrado(s).",
+            len(users),
+        )
+        for login, domain in users[:20]:
+            self.logger.warning("  user: %s (%s)", login, domain)
+        if len(users) > 20:
+            self.logger.warning("  ... e mais %d FTP user(s).", len(users) - 20)
+
+        if not reset:
+            self.logger.warning(
+                "fix_ftp_passwords: rode com --reset-ftp-passwords para "
+                "gerar senhas novas (CSV em %s/ftp-password-reset.csv).",
+                self.log_dir,
+            )
+            # Escrever audit-only CSV
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = self.log_dir / "ftp-password-status.csv"
+            try:
+                with csv_path.open("w", encoding="utf-8") as fh:
+                    fh.write("timestamp,login,domain\n")
+                    ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                    for login, domain in users:
+                        fh.write(f"{ts},{login},{domain}\n")
+            except OSError as exc:
+                self.logger.error("fix_ftp_passwords: erro escrevendo %s: %s", csv_path, exc)
+            return
+
+        # Reset mode
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = self.log_dir / "ftp-password-reset.csv"
+        new_file = not csv_path.exists()
+        try:
+            csv_path.touch(mode=0o600, exist_ok=True)
+            os.chmod(csv_path, 0o600)
+        except OSError as exc:
+            raise PhaseExecutionError(
+                f"fix_ftp_passwords: não consegui criar {csv_path}: {exc}"
+            ) from exc
+
+        reset_count = 0
+        with csv_path.open("a", encoding="utf-8") as fh:
+            if new_file:
+                fh.write("timestamp,login,domain,new_password\n")
+            for login, domain in users:
+                # Gerar senha que não comece com - ou _
+                while True:
+                    new_pwd = secrets.token_urlsafe(16)
+                    if new_pwd[0] not in "-_":
+                        break
+                self.sensitive_values.append(new_pwd)
+                try:
+                    self._run(
+                        [str(self.plesk_bin), "bin", "ftpuser",
+                         "-u", login, "-passwd", new_pwd],
+                        timeout=60,
+                        log_to=self.log_dir / "fix-ftp-passwords.log",
+                    )
+                except (PhaseExecutionError, subprocess.CalledProcessError) as exc:
+                    self.logger.error(
+                        "fix_ftp_passwords: falha resetando %s: %s", login, exc
+                    )
+                    continue
+                ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                fh.write(f"{ts},{login},{domain},{new_pwd}\n")
+                reset_count += 1
+
+        try:
+            os.chmod(csv_path, 0o600)
+        except OSError:
+            pass
+        self.logger.warning(
+            "fix_ftp_passwords: %d/%d FTP user(s) resetada(s). CSV: %s "
+            "(distribua via canal seguro fora-de-banda).",
+            reset_count, len(users), csv_path,
         )
 
     def fix_mail_quota(self) -> None:
