@@ -2145,14 +2145,14 @@ class PleskMigrationOrchestrator:
             )
             if self.dry_run:
                 self.logger.info(
-                    "[DRY-RUN] %s bin subscription -u %s -www-root %s",
-                    self.plesk_bin, domain, target,
+                    "[DRY-RUN] %s bin subscription -u %s -www-root %s (abs=%s)",
+                    self.plesk_bin, domain, choice, target,
                 )
                 continue
 
             self._run(
                 [str(self.plesk_bin), "bin", "subscription",
-                 "-u", domain, "-www-root", str(target)],
+                 "-u", domain, "-www-root", choice],
                 timeout=TIMEOUT_FIX_DOCROOT,
                 log_to=report,
             )
