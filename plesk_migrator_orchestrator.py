@@ -2646,17 +2646,34 @@ class PleskMigrationOrchestrator:
                     if new_pwd and new_pwd[0] not in "-_":
                         break
                 self.sensitive_values.append(new_pwd)
+                # CLI: plesk bin ftpsubaccount (NOT ftpuser — last não existe
+                # nesta build). Senha via env PSA_PASSWORD (recomendação Plesk:
+                # evita leak via /proc/<pid>/cmdline — mesmo padrão sshpass -e).
+                cmd = [
+                    str(self.plesk_bin), "bin", "ftpsubaccount",
+                    "--update", login, "-passwd", "",
+                ]
+                if dom:
+                    cmd.extend(["-domain", dom])
+                self.logger.info("$ %s (PSA_PASSWORD=***)", " ".join(cmd))
+                env = dict(os.environ)
+                env["PSA_PASSWORD"] = new_pwd
                 try:
-                    self._run(
-                        [str(self.plesk_bin), "bin", "ftpuser",
-                         "-u", login, "-passwd", new_pwd],
-                        timeout=60,
-                        log_to=self.log_dir / "fix-ftp-passwords.log",
+                    proc = subprocess.run(
+                        cmd, env=env, capture_output=True, text=True,
+                        timeout=60, check=False,
                     )
-                except (PhaseExecutionError, subprocess.CalledProcessError) as exc:
+                except (OSError, subprocess.TimeoutExpired) as exc:
                     self.logger.error(
                         "fix_ftp_passwords: falha resetando %s: %s",
                         login, exc,
+                    )
+                    continue
+                if proc.returncode != 0:
+                    self.logger.error(
+                        "fix_ftp_passwords: ftpsubaccount rc=%d para %s: %s",
+                        proc.returncode, login,
+                        proc.stderr.strip()[:200] or proc.stdout.strip()[:200],
                     )
                     continue
                 ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
