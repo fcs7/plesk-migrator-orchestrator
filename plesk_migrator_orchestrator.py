@@ -1844,9 +1844,13 @@ class PleskMigrationOrchestrator:
         <log_dir>/docroot-diff-<domain>.csv listing which files are only
         on the cPanel source vs only on the Plesk destination — turning
         the opaque 'DIVERGE' signal into an actionable per-file list."""
-        cpanel_user = domain.split(".", 1)[0]  # best-effort default; cPanel
-        # accounts are typically named after the first label or a truncation
-        # — operators with exotic mappings can extend this later.
+        cpanel_user = (
+            self._resolve_cpanel_user(domain)
+            or domain.split(".", 1)[0]
+        )
+        # /etc/userdomains is the canonical WHM mapping. Heuristic first-label
+        # remains as fallback for hosts without /etc/userdomains access (rare)
+        # or domains genuinely matching the heuristic.
         remote_path = f"/home/{cpanel_user}/public_html"
         src_count, src_bytes, src_hash, src_body = self._remote_dir_manifest(
             remote_path,
@@ -2024,6 +2028,73 @@ class PleskMigrationOrchestrator:
         if not digest:
             return 0, 0, "", ""
         return count, total, digest, body
+
+    def _resolve_cpanel_user(self, domain: str) -> str | None:
+        """Resolve real cPanel username for `domain` via WHM canonical
+        mapping `/etc/userdomains` (one line per domain: `<dom>: <user>`).
+
+        Returns the username (stripped) or None on:
+          - SSH failure (sshpass missing, host unreachable, rc != 0)
+          - missing/empty grep result (domain not in /etc/userdomains)
+          - dry_run mode (avoids networking in tests)
+
+        Results cached per session in `self._cpanel_user_cache` keyed by
+        domain. Empty result also cached (None) to avoid retrying a
+        failed lookup mid-pipeline.
+
+        Caller should `or domain.split('.', 1)[0]` to fall back to the
+        legacy first-label heuristic on None (backward compatibility)."""
+        if self.dry_run:
+            return None
+        cache = getattr(self, "_cpanel_user_cache", None)
+        if cache is None:
+            cache = {}
+            self._cpanel_user_cache = cache
+        if domain in cache:
+            return cache[domain]
+        src = self.config.get("source") or {}
+        host = src.get("host")
+        password = src.get("ssh_password")
+        port = int(src.get("ssh_port", 22))
+        if not host or not password:
+            cache[domain] = None
+            return None
+        remote_cmd = (
+            f"grep -E '^{shlex.quote(domain)}:[[:space:]]' "
+            f"/etc/userdomains | awk '{{print $2}}'"
+        )
+        argv = [
+            "sshpass", "-e",
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=15",
+            "-o", "BatchMode=no",
+            "-p", str(port),
+            f"root@{host}",
+            remote_cmd,
+        ]
+        env = {**os.environ, "SSHPASS": str(password)}
+        try:
+            proc = subprocess.run(
+                argv, capture_output=True, text=True,
+                timeout=30, check=False, env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+            self.logger.debug(
+                "_resolve_cpanel_user: ssh falhou (%s): %s", domain, exc,
+            )
+            cache[domain] = None
+            return None
+        if proc.returncode != 0:
+            self.logger.debug(
+                "_resolve_cpanel_user: rc=%d para %s", proc.returncode, domain,
+            )
+            cache[domain] = None
+            return None
+        user = proc.stdout.strip()
+        cache[domain] = user if user else None
+        return cache[domain]
 
     @staticmethod
     def _pick_docroot(
