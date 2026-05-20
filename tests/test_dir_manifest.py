@@ -83,6 +83,35 @@ class DirManifestTests(unittest.TestCase):
             self.assertEqual(total, 0)
             self.assertEqual(digest, hashlib.md5(b"").hexdigest())
 
+    def test_entries_globally_lex_sorted_matches_remote_format(self) -> None:
+        """Local manifest must use the SAME entry ordering as the remote
+        helper (`find ... | sort -u`) — a full lexicographic sort over
+        joined "relpath:size" strings. os.walk yields root-files first,
+        then descends per-subdir, which breaks parity for any tree where
+        a root file lex-sorts after a first-level subdir name. The local
+        helper must call entries.sort() before MD5 to align."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            # `zzz.txt` lex-sorts after `aaa/` — os.walk would emit it
+            # first (root-files-first), `find | sort -u` emits it last.
+            (root / "zzz.txt").write_text("hi")  # 2 bytes
+            (root / "aaa").mkdir()
+            (root / "aaa" / "file.php").write_text("xxx")  # 3 bytes
+
+            count, total, digest = PleskMigrationOrchestrator._dir_manifest(
+                root
+            )
+            expected_body = "\n".join(sorted([
+                "aaa/file.php:3",
+                "zzz.txt:2",
+            ]))
+            expected_digest = hashlib.md5(
+                expected_body.encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(count, 2)
+            self.assertEqual(total, 5)
+            self.assertEqual(digest, expected_digest)
+
 
 if __name__ == "__main__":
     unittest.main()

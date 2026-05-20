@@ -212,6 +212,30 @@ class SubscriptionOnlyReservedFailuresTests(unittest.TestCase):
                 orch._subscription_only_reserved_failures("x.com", session)
             )
 
+    def test_per_domain_filter_isolates_cross_domain_failures(self) -> None:
+        """When a shared report mentions a reserved subdomain for domain A
+        *and* a non-reserved failure for domain B, the classifier for A
+        must still return True — failures belonging to B must not poison
+        A's classification. Regression for the cross-domain pollution bug."""
+        orch = self._make_orch()
+        orch._domain_exists_in_plesk = mock.MagicMock(return_value=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            session = pathlib.Path(tmp)
+            (session / "accounts_report_tree.2026.05.19.14.27.47").write_text(
+                "sites of subscription were not created - they do not exist"
+                " on target panel: 'webmail.a.com'\n"
+                "sites of subscription were not created - they do not exist"
+                " on target panel: 'shop.b.com'\n"
+            )
+            # A.com has only a reserved-subdomain failure → recoverable.
+            self.assertTrue(
+                orch._subscription_only_reserved_failures("a.com", session)
+            )
+            # B.com has a non-reserved failure → NOT recoverable.
+            self.assertFalse(
+                orch._subscription_only_reserved_failures("b.com", session)
+            )
+
 
 class RetransferFailedBranchTests(unittest.TestCase):
     """Exercises retransfer_failed stagnation + max_attempts paths with
