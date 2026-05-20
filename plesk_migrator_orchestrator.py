@@ -1981,7 +1981,15 @@ class PleskMigrationOrchestrator:
                 argv, capture_output=True, text=True,
                 timeout=180, check=False, env=env,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (
+            OSError, subprocess.TimeoutExpired, UnicodeDecodeError,
+        ) as exc:
+            # UnicodeDecodeError happens when cPanel has filenames stored
+            # in Latin-1 (legacy PHP-era hosts saving `relatório.pdf` etc)
+            # — text=True auto-decode raises during run(). Without this
+            # guard the phase that documents "nunca aborta" would crash
+            # on one mojibake filename. Graceful skip → operator sees
+            # "validação cross-server pulada" and inspects manually.
             self.logger.warning(
                 "_remote_dir_manifest: ssh falhou: %s", exc,
             )
