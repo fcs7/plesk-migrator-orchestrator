@@ -64,15 +64,19 @@ class RemoteDirManifestTests(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertEqual(total, 7)
         self.assertEqual(digest, remote_md5)
-        # Verify the command actually invoked sshpass + ssh against the
-        # configured host/port/password and ran the canonical pipeline.
+        # Verify the command actually invoked sshpass -e + ssh against the
+        # configured host/port and ran the canonical pipeline. The password
+        # must NEVER appear on argv — it is passed via the SSHPASS env var
+        # (sshpass(1) -e mode) to keep it out of /proc/<pid>/cmdline.
         called_args = run_mock.call_args[0][0]
         self.assertEqual(called_args[0], "sshpass")
-        self.assertIn("-p", called_args)
-        self.assertIn("secret", called_args)
+        self.assertIn("-e", called_args)
+        self.assertNotIn("secret", called_args)
         self.assertIn("ssh", called_args)
         self.assertIn("cpanel.example.com", " ".join(called_args))
         self.assertIn("/home/opiniaoi/public_html", " ".join(called_args))
+        env = run_mock.call_args.kwargs.get("env") or {}
+        self.assertEqual(env.get("SSHPASS"), "secret")
 
     def test_ssh_failure_returns_zero_zero_empty(self) -> None:
         orch = self._make_orch()
@@ -134,6 +138,27 @@ class RemoteDirManifestTests(unittest.TestCase):
             count, total, digest = orch._remote_dir_manifest("/tmp/x")
         self.assertEqual((count, total, digest), (0, 0, ""))
 
+    def test_remote_empty_body_returns_empty_digest(self) -> None:
+        """When `find` returns no files (path missing / empty dir / SSH
+        rc=0 but no output), the shell pipeline must emit MD5= (empty)
+        rather than md5sum of empty stdin (`d41d8cd98f00b204e9800998ecf8427e`).
+        That keeps `_validate_docroot_match`'s `if not src_hash:` guard
+        firing the documented 'pulada' warning instead of bogus DIVERGE."""
+        orch = self._make_orch()
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="COUNT=0\nTOTAL=0\nMD5=\n",
+            stderr="",
+        )
+        with mock.patch(
+            "plesk_migrator_orchestrator.subprocess.run",
+            return_value=completed,
+        ):
+            count, total, digest = orch._remote_dir_manifest(
+                "/home/missing/public_html"
+            )
+        self.assertEqual((count, total, digest), (0, 0, ""))
+
 
 class FixDocrootValidationIntegrationTests(unittest.TestCase):
     """Verifies fix_docroot logs match/diverge AFTER applying www-root."""
@@ -172,45 +197,10 @@ class FixDocrootValidationIntegrationTests(unittest.TestCase):
         public_html.mkdir()
         (public_html / "index.html").write_bytes(b"x" * has_public_html_bytes)
 
-    def test_hash_match_logs_info_ok(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            vhost_root = pathlib.Path(tmp) / "vhosts"
-            vhost_root.mkdir()
-            self._set_up_vhost(vhost_root, has_public_html_bytes=42)
-            orch = self._make_orch(vhost_root)
-            # Stub the LOCAL _dir_manifest and the REMOTE one to return
-            # matching hashes.
-            local_manifest = (1, 42, "deadbeef")
-            with mock.patch(
-                "plesk_migrator_orchestrator.pathlib.Path",
-                pathlib.Path,
-            ):
-                with mock.patch.object(
-                    PleskMigrationOrchestrator, "_dir_manifest",
-                    staticmethod(lambda p: local_manifest if "public_html" in str(p) else (0, 0, hashlib.md5(b"").hexdigest())),
-                ):
-                    orch._remote_dir_manifest = mock.MagicMock(
-                        return_value=(1, 42, "deadbeef")
-                    )
-                    # fix_docroot's vhost root is hard-coded to /var/www/vhosts;
-                    # we monkeypatch it via a wrapper attribute the impl will read.
-                    # If your impl uses pathlib.Path("/var/www/vhosts") directly,
-                    # set fix_docroot's vhosts_root via patching that line:
-                    with mock.patch(
-                        "plesk_migrator_orchestrator.pathlib.Path",
-                        side_effect=lambda *a, **kw: pathlib.Path(*a, **kw),
-                    ):
-                        # Simpler: directly call the helper. Skip end-to-end and
-                        # assert the integration block by stubbing.
-                        pass
-            # End-to-end is awkward because of the hard-coded /var/www/vhosts.
-            # Instead, exercise the integration block by patching it via a
-            # `_validate_docroot_match(domain, local_path)` seam (see Task 6.2).
-            self.skipTest(
-                "End-to-end fix_docroot test deferred — see "
-                "test_validate_docroot_match_logs_ok below for the "
-                "behavior under test."
-            )
+    # End-to-end fix_docroot coverage is provided by the
+    # _validate_docroot_match seam below (test_validate_docroot_match_*).
+    # Per-instance integration through fix_docroot is exercised manually on
+    # the Plesk box during real migrations.
 
     def test_validate_docroot_match_logs_ok(self) -> None:
         """Targeted test of the validation block, hoisted into a small

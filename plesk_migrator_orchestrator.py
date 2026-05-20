@@ -1558,39 +1558,48 @@ class PleskMigrationOrchestrator:
         self.logger.info("fix_limits: %d subscription(s) atualizada(s)", updated)
 
     @staticmethod
-    def _parse_reserved_subdomain_failures(
+    def _parse_reserved_subdomain_failure_hosts(
         session_dir: pathlib.Path,
-    ) -> set[str]:
-        """Parse the newest accounts_report_tree.* in `session_dir` and return
-        the set of first-label segments of subdomains that plesk-migrator
-        failed to create with the message:
-          "sites of subscription were not created - they do not exist on
-           target panel: '<host>'"
-        Returns the set of `host.split('.', 1)[0]` for every match (e.g.
-        {"webmail"} when webmail.example.com failed).
+    ) -> list[str]:
+        """Raw hosts extracted from the newest accounts_report_tree.* in
+        `session_dir`. No dedup, no first-label split — internal helper
+        consumed by both `_parse_reserved_subdomain_failures` (label set)
+        and `_subscription_only_reserved_failures` (per-domain filter).
 
         Missing session dir, no matching report, and unreadable files all
-        yield set(). Filenames sorted lexicographically — the timestamped
-        suffix is wide enough to keep that aligned with chronological order
-        for plesk-migrator output."""
+        yield []."""
         if not session_dir.is_dir():
-            return set()
+            return []
         candidates = sorted(
             p for p in session_dir.glob("accounts_report_tree.*")
             if p.is_file() and ".json" not in p.suffixes
         )
         if not candidates:
-            return set()
-        latest = candidates[-1]
+            return []
         try:
-            text = latest.read_text(encoding="utf-8", errors="replace")
+            text = candidates[-1].read_text(
+                encoding="utf-8", errors="replace"
+            )
         except OSError:
-            return set()
+            return []
         pattern = re.compile(
             r"sites of subscription were not created[^:]*:\s+'([^']+)'"
         )
+        return pattern.findall(text)
+
+    @classmethod
+    def _parse_reserved_subdomain_failures(
+        cls, session_dir: pathlib.Path,
+    ) -> set[str]:
+        """Set of first-label segments of subdomains that plesk-migrator
+        failed to create with the message:
+          "sites of subscription were not created - they do not exist on
+           target panel: '<host>'"
+        Returns `{host.split('.', 1)[0].lower()}` for every match (e.g.
+        {"webmail"} when webmail.example.com failed). Returns set() if
+        the session dir is missing, no report exists, or files unreadable."""
         labels: set[str] = set()
-        for host in pattern.findall(text):
+        for host in cls._parse_reserved_subdomain_failure_hosts(session_dir):
             first = host.split(".", 1)[0].lower()
             if first:
                 labels.add(first)
@@ -1621,18 +1630,31 @@ class PleskMigrationOrchestrator:
 
         Returns True iff:
           1. The newest accounts_report_tree.* contains at least one
-             "sites of subscription were not created" failure.
-          2. ALL such failures are first-label members of
+             "sites of subscription were not created" failure for THIS
+             `domain` (host == domain or host.endswith("." + domain)).
+          2. ALL such per-domain failures are first-label members of
              RESERVED_PLESK_SUBDOMAINS (webmail, mail, ftp, ...).
           3. `domain` already exists in psa.domains (subscription was
              created by plesk-migrator before the reserved subdomain hit
              the wall — so we have working hosting, just not the blocked
              subdomain that Plesk would refuse anyway).
 
+        Filtering by domain is what keeps this classifier per-subscription:
+        cross-domain failures (e.g. `shop.OTHER.com` blocking another
+        subscription) must NOT taint this domain's classification.
+
         Used by retransfer_failed to skip retrying domains that will never
         succeed (Plesk reserves these subdomain names) but whose parent
         subscription is already operational."""
-        labels = self._parse_reserved_subdomain_failures(session_dir)
+        hosts = self._parse_reserved_subdomain_failure_hosts(session_dir)
+        own = [
+            h for h in hosts
+            if h == domain or h.endswith("." + domain)
+        ]
+        if not own:
+            return False
+        labels = {h.split(".", 1)[0].lower() for h in own}
+        labels.discard("")
         if not labels:
             return False
         if not labels.issubset(set(RESERVED_PLESK_SUBDOMAINS)):
@@ -1802,6 +1824,7 @@ class PleskMigrationOrchestrator:
                     entries.append(f"{rel}:{st.st_size}")
                     count += 1
                     total += st.st_size
+        entries.sort()
         digest = hashlib.md5("\n".join(entries).encode("utf-8")).hexdigest()
         return count, total, digest
 
@@ -1878,15 +1901,18 @@ class PleskMigrationOrchestrator:
             f"set -e; "
             f"body=$(find {shlex.quote(remote_path)} -type f "
             f"-printf '%P:%s\\n' 2>/dev/null | sort -u); "
+            f"if [ -z \"$body\" ]; then "
+            f"count=0; total=0; md5=; "
+            f"else "
             f"count=$(printf '%s\\n' \"$body\" | grep -c '^' || true); "
-            f"if [ -z \"$body\" ]; then count=0; fi; "
             f"total=$(printf '%s\\n' \"$body\" | awk -F: '{{s+=$NF}} "
             f"END{{print s+0}}'); "
             f"md5=$(printf '%s' \"$body\" | md5sum | awk '{{print $1}}'); "
+            f"fi; "
             f"echo \"COUNT=$count\"; echo \"TOTAL=$total\"; echo \"MD5=$md5\""
         )
         argv = [
-            "sshpass", "-p", str(password),
+            "sshpass", "-e",
             "ssh",
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
@@ -1896,10 +1922,11 @@ class PleskMigrationOrchestrator:
             f"root@{host}",
             remote_cmd,
         ]
+        env = {**os.environ, "SSHPASS": str(password)}
         try:
             proc = subprocess.run(
                 argv, capture_output=True, text=True,
-                timeout=180, check=False,
+                timeout=180, check=False, env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             self.logger.warning(
@@ -2061,9 +2088,10 @@ class PleskMigrationOrchestrator:
 
             # Cross-server hash validation: compare cPanel source public_html
             # against the Plesk dir we just pointed www-root at. Divergence
-            # logs a warning only — never aborts migration.
-            if not self.dry_run:
-                self._validate_docroot_match(domain, target)
+            # logs a warning only — never aborts migration. The dry-run
+            # branch above already `continue`s, so we always reach here in
+            # real-execution mode.
+            self._validate_docroot_match(domain, target)
 
     def fix_mailpath(self, *, apply: bool = False) -> None:
         """Audita onde plesk-migrator depositou Maildirs vs onde o Plesk
