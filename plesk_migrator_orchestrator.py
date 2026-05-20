@@ -2539,7 +2539,7 @@ class PleskMigrationOrchestrator:
         for dom in domains:
             select_sql = (
                 f"SELECT id, host, type FROM dns_recs "
-                f"WHERE domain_id=(SELECT id FROM domains "
+                f"WHERE dom_id=(SELECT id FROM domains "
                 f"WHERE name='{self._sql_escape(dom)}') "
                 f"AND host REGEXP '^({prefixes})\\\\.';"
             )
@@ -2563,7 +2563,7 @@ class PleskMigrationOrchestrator:
                 continue
             delete_sql = (
                 f"DELETE FROM dns_recs "
-                f"WHERE domain_id=(SELECT id FROM domains "
+                f"WHERE dom_id=(SELECT id FROM domains "
                 f"WHERE name='{self._sql_escape(dom)}') "
                 f"AND host REGEXP '^({prefixes})\\\\.';"
             )
