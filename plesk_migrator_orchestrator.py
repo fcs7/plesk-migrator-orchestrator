@@ -2501,7 +2501,14 @@ class PleskMigrationOrchestrator:
         - Default (reset=False): audit-only, escreve ftp-password-status.csv
         - reset=True: gera senha secrets.token_urlsafe(16) por user, chama
           `plesk bin ftpuser -u <login> -passwd <pwd>`, escreve
-          ftp-password-reset.csv chmod 600, adiciona senhas a sensitive_values."""
+          ftp-password-reset.csv chmod 600, adiciona senhas a sensitive_values.
+
+        NOTE: Query joins sys_users → hosting → domains (canonical join order),
+        reaching primary subscription owners. Additional sub-FTP users renamed by
+        Plesk (e.g., strauss_opiniao.inf.br) may not be captured by this join.
+        If live execution shows missing users, the query can be widened to include
+        subqueries against additional FTP user storage. Currently prioritizes
+        correctness over coverage."""
         self.logger.info("Fase: fix_ftp_passwords (reset=%s)", reset)
         if not self.plesk_bin:
             self.logger.warning(
@@ -2520,18 +2527,15 @@ class PleskMigrationOrchestrator:
             return
 
         # Escapar cada domínio para SQL IN clause
-        escaped_domains = ", ".join(
-            f"'{self._sql_escape(d)}'" for d in domains_list
-        )
+        placeholders = ",".join(f"'{self._sql_escape(d)}'" for d in domains_list)
 
         sql = (
-            f"SELECT DISTINCT su.login, COALESCE(d.name, '') AS domain "
-            f"FROM sys_users su "
-            f"JOIN hosting h ON h.sys_user_id=su.id OR su.login LIKE CONCAT('%\\_', "
-            f"SUBSTRING_INDEX(d.name, '.', 1), '%') "
-            f"JOIN domains d ON d.id=h.dom_id "
-            f"WHERE d.name IN ({escaped_domains}) "
-            f"ORDER BY d.name, su.login;"
+            "SELECT su.login, d.name "
+            "FROM sys_users su "
+            "JOIN hosting h ON h.sys_user_id=su.id "
+            "JOIN domains d ON d.id=h.dom_id "
+            f"WHERE d.name IN ({placeholders}) "
+            "ORDER BY d.name, su.login;"
         )
 
         if self.dry_run:
@@ -2619,7 +2623,7 @@ class PleskMigrationOrchestrator:
                 # Gerar senha que não comece com - ou _
                 while True:
                     new_pwd = secrets.token_urlsafe(16)
-                    if new_pwd[0] not in "-_":
+                    if new_pwd and new_pwd[0] not in "-_":
                         break
                 self.sensitive_values.append(new_pwd)
                 try:
