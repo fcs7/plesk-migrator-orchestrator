@@ -87,6 +87,21 @@ class RemoteDirManifestTests(unittest.TestCase):
             count, total, digest, _body = orch._remote_dir_manifest("/tmp/x")
         self.assertEqual((count, total, digest, _body), (0, 0, "", ""))
 
+    def test_unicode_decode_error_does_not_abort(self) -> None:
+        """cPanel hosts with Latin-1-encoded filenames trigger
+        UnicodeDecodeError inside subprocess.run(text=True). Must be
+        swallowed like OSError — the phase's 'never aborts' contract
+        depends on it."""
+        orch = self._make_orch()
+        with mock.patch(
+            "plesk_migrator_orchestrator.subprocess.run",
+            side_effect=UnicodeDecodeError(
+                "utf-8", b"\xe9", 0, 1, "invalid start byte",
+            ),
+        ):
+            count, total, digest, _body = orch._remote_dir_manifest("/tmp/x")
+        self.assertEqual((count, total, digest, _body), (0, 0, "", ""))
+
     def test_nonzero_rc_returns_zero_zero_empty(self) -> None:
         orch = self._make_orch()
         completed = subprocess.CompletedProcess(
