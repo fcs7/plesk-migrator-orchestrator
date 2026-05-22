@@ -2473,8 +2473,16 @@ class PleskMigrationOrchestrator:
          "authgroupfile-home"),
         # php_value / php_admin_value são ignorados pelo Plesk PHP-FPM
         # e podem causar erros em PHP 8+ se forem inválidos.
-        (re.compile(r"^\s*php_(?:admin_)?value\b", re.IGNORECASE),
-         "php_value / php_admin_value (Plesk PHP-FPM ignora htaccess)",
+        # IMPORTANTE: `php_value engine off` é PROTEÇÃO DE SEGURANÇA usada
+        # em diretórios de upload (impede execução de PHP em arquivos
+        # uploadados — previne RCE). Mod_php honra a directiva mesmo no
+        # Plesk PHP-FPM dependendo da config. NUNCA comentar essa linha.
+        (re.compile(
+            r"^\s*php_(?:admin_)?value\s+(?!engine\b)\S+",
+            re.IGNORECASE,
+        ),
+         "php_value / php_admin_value (Plesk PHP-FPM ignora htaccess; "
+         "engine off preservado por ser proteção de segurança)",
          "php-value"),
         # Handlers cPanel-only.
         (re.compile(

@@ -242,6 +242,30 @@ class FixHtaccessApplyTest(unittest.TestCase):
         self.assertIn("#FIX# php_admin_value", fixed)
         self.assertIn("RewriteEngine on", fixed)
 
+    def test_apply_preserves_php_value_engine_off(self) -> None:
+        """SEGURANÇA: `php_value engine off` é proteção contra execução de
+        PHP em diretórios de upload (anti-RCE). NUNCA deve ser comentado."""
+        path = self._write_htaccess(
+            "site.example/public_html/uploads/.htaccess",
+            "php_value engine off\n"
+            "  php_admin_value engine off\n"
+            "php_value upload_max_filesize 64M\n",
+        )
+        with patch.object(self.orch, "_load_migrated_domains",
+                          return_value=["site.example"]), \
+             patch.object(self.orch, "_load_migrated_subdomains",
+                          return_value=[]), \
+             self._patch_vhosts():
+            self.orch.fix_htaccess(apply=True)
+        fixed = path.read_text(encoding="utf-8")
+        # `engine off` lines preserved unmodified
+        self.assertIn("php_value engine off", fixed)
+        self.assertIn("php_admin_value engine off", fixed)
+        self.assertNotIn("#FIX# php_value engine off", fixed)
+        self.assertNotIn("#FIX# php_admin_value engine off", fixed)
+        # Other php_value still commented out
+        self.assertIn("#FIX# php_value upload_max_filesize", fixed)
+
     def test_apply_is_idempotent(self) -> None:
         """Re-rodar com apply em arquivo já fixado não duplica `#FIX# ` nem
         cria backup novo se nada mudar."""
