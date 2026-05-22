@@ -3453,6 +3453,12 @@ class PleskMigrationOrchestrator:
         "User password is encrypted",
         "Cannot verify access",
         "Cannot verify the password",
+        # DNS divergence durante migração:
+        #   * `_acme-challenge.*` muda toda hora (Let's Encrypt rotaciona TXT).
+        #   * cpcontacts/cpanel/whm/webdisk são auto-created pelo cPanel e
+        #     viram divergência esperada (já tratada por `fix-dns-conflicts`).
+        # Fora da janela de migração esses erros sumem.
+        "returned incorrect DNS records",
     )
 
     def _classify_test_all_report(self) -> tuple[str, dict]:
