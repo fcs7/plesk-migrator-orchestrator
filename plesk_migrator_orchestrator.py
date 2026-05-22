@@ -100,6 +100,21 @@ TIMEOUT_FIX_OWNER = 1800       # 30 min — cria customer + reassign subscriptio
 # httpdocs primeiro porque é o canonical Plesk; se rivaliza com outro, vence.
 DOCROOT_CANDIDATES = ("httpdocs", "public_html", "www", "web")
 
+# Candidates pra subdomain. Plesk default subdomain dir é
+# `<vhost-root>/<sub-full-name>` (ex.: `webmail.opiniao.inf.br`); cPanel
+# Migrator pode depositar conteúdo em variações cPanel-style ou em label-only.
+# A primeira entrada é sempre o canonical Plesk (= sub-full-name) — substituído
+# em runtime via `.format(sub_full=..., sub_label=...)`.
+SUBDOMAIN_DOCROOT_CANDIDATES = (
+    "{sub_full}",
+    "{sub_label}",
+    "{sub_label}/public_html",
+    "{sub_label}/httpdocs",
+    "public_html/{sub_label}",
+    "{sub_full}/httpdocs",
+    "{sub_full}/public_html",
+)
+
 # Subdomains reservados pelo Plesk (primeiro label do FQDN). Aplicação cPanel
 # que use esses nomes precisa rename — sanitize-list propõe alternativas.
 RESERVED_PLESK_SUBDOMAINS = (
@@ -370,7 +385,8 @@ class PleskMigrationOrchestrator:
         skip = behavior.get("skip") or {}
         for key in (
             "web_content", "mail_content", "db_content",
-            "fix_docroot", "fix_mailpath", "check_mail_passwords",
+            "fix_docroot", "fix_docroot_subdomains",
+            "fix_mailpath", "check_mail_passwords",
             "fix_ftp_passwords",
             "sanitize_list", "fix_limits", "retransfer_failed",
             "fix_mail_quota", "fix_ftp_renames", "fix_dns_conflicts",
@@ -1045,6 +1061,44 @@ class PleskMigrationOrchestrator:
                                       len(domains), path.name)
                     return domains
         return []
+
+    def _load_migrated_subdomains(self) -> list[tuple[str, str]]:
+        """Lista (parent, sub_full_name) para subdomains pertencentes a
+        subscriptions migradas. Fonte: `psa.domains` JOIN consigo via
+        `parentDomainId`. Filtra por `parent.name IN (...)` dos parents
+        retornados por `_load_migrated_domains`.
+
+        Retorna lista vazia se: (a) nenhum parent migrado; (b) falha SQL
+        (`_run_plesk_db` levanta `PhaseExecutionError` — capturado e logado
+        como warning para não derrubar a fase parent loop).
+        """
+        parents = self._load_migrated_domains()
+        if not parents:
+            return []
+        placeholders = ",".join(f"'{self._sql_escape(d)}'" for d in parents)
+        sql = (
+            "SELECT p.name, d.name "
+            "FROM domains d "
+            "JOIN domains p ON d.parentDomainId = p.id "
+            f"WHERE d.parentDomainId != 0 AND p.name IN ({placeholders}) "
+            "ORDER BY p.name, d.name;"
+        )
+        try:
+            out = self._run_plesk_db(sql, fetch=True)
+        except PhaseExecutionError as exc:
+            self.logger.warning(
+                "_load_migrated_subdomains: SQL falhou (%s) — "
+                "subdomains não serão corrigidos nesta execução.", exc,
+            )
+            return []
+        if not out:
+            return []
+        pairs: list[tuple[str, str]] = []
+        for ln in out.splitlines():
+            parts = ln.split("\t")
+            if len(parts) >= 2 and parts[0].strip() and parts[1].strip():
+                pairs.append((parts[0].strip(), parts[1].strip()))
+        return pairs
 
     _OWNER_HEADER_RE = re.compile(
         r"^\s*(Customer|Reseller|Plan)\s*:\s*(.+?)\s*$", re.IGNORECASE
@@ -2190,21 +2244,20 @@ class PleskMigrationOrchestrator:
                 "Necessário para `plesk bin subscription`."
             )
 
-        domains = self._load_migrated_domains()
-        if not domains:
-            self.logger.warning(
-                "fix_docroot: nenhuma subscription migrada encontrada em %s — skip",
-                self.sessions_dir / self.session_name,
-            )
-            return
-
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self.logger.warning("fix_docroot: log_dir mkdir falhou: %s", exc)
         report = self.log_dir / "fix-docroot.log"
-
         vhosts_root = pathlib.Path("/var/www/vhosts")
+
+        domains = self._load_migrated_domains()
+        if not domains:
+            self.logger.warning(
+                "fix_docroot: nenhuma subscription migrada encontrada em %s "
+                "— pulando parent loop (subdomain loop ainda pode rodar)",
+                self.sessions_dir / self.session_name,
+            )
         for domain in domains:
             vhost = vhosts_root / domain
             if not vhost.is_dir():
@@ -2271,6 +2324,127 @@ class PleskMigrationOrchestrator:
             # branch above already `continue`s, so we always reach here in
             # real-execution mode.
             self._validate_docroot_match(domain, target)
+
+        # ------- Subdomain coverage (parentDomainId != 0) -------------
+        # plesk-migrator deixa subdomains com `domains.www_root` apontando
+        # para path cPanel-style inexistente — Apache devolve 403/404. Aqui
+        # detectamos onde o conteúdo realmente ficou (mesmo manifest stat-only
+        # do parent loop) e aplicamos `plesk bin subdomain -www-root` com
+        # path RELATIVO ao vhost root (mesmo trap do parent — passar absoluto
+        # faz Plesk concatenar duas vezes).
+        if getattr(self, "skip_fix_docroot_subdomains", False):
+            self.logger.info(
+                "fix_docroot: subdomain loop pulado (skip_fix_docroot_subdomains=True)"
+            )
+            return
+
+        subdomains = self._load_migrated_subdomains()
+        if not subdomains:
+            self.logger.info("fix_docroot: 0 subdomains migrados — pulando subdomain loop")
+            return
+
+        self.logger.info(
+            "fix_docroot: processando %d subdomain(s)", len(subdomains)
+        )
+        for parent, sub_full in subdomains:
+            if "." not in sub_full:
+                self.logger.warning(
+                    "fix_docroot: subdomain %s sem `.` — ignorando", sub_full
+                )
+                continue
+            sub_label = sub_full.split(".", 1)[0]
+            vhost = vhosts_root / parent
+            if not vhost.is_dir():
+                self.logger.warning(
+                    "fix_docroot: vhost parent %s ausente — pulando %s",
+                    vhost, sub_full,
+                )
+                continue
+
+            seen: set[str] = set()
+            sub_manifests: dict[str, tuple[int, int, str]] = {}
+            for tmpl in SUBDOMAIN_DOCROOT_CANDIDATES:
+                candidate_rel = tmpl.format(sub_full=sub_full, sub_label=sub_label)
+                if candidate_rel in seen:
+                    continue
+                seen.add(candidate_rel)
+                c, b, h, _body = self._dir_manifest(vhost / candidate_rel)
+                sub_manifests[candidate_rel] = (c, b, h)
+
+            scan_summary = ", ".join(
+                f"{n}={c}f/{b}B/{h[:8]}"
+                for n, (c, b, h) in sub_manifests.items()
+            )
+            self.logger.info(
+                "fix_docroot[sub]: %s scan: %s", sub_full, scan_summary
+            )
+
+            try:
+                with report.open("a", encoding="utf-8") as fh:
+                    ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                    fh.write(f"# {ts} [sub] {sub_full} (parent={parent})\n")
+                    for n, (c, b, h) in sub_manifests.items():
+                        fh.write(f"  {n}: count={c} bytes={b} hash={h}\n")
+            except OSError as exc:
+                self.logger.warning(
+                    "fix_docroot[sub]: falha escrevendo report: %s", exc
+                )
+
+            sub_choice = self._pick_subdomain_docroot(sub_manifests, sub_full)
+            if sub_choice is None:
+                self.logger.info(
+                    "fix_docroot[sub]: %s nada a ajustar — skip", sub_full
+                )
+                continue
+
+            self.logger.info(
+                "fix_docroot[sub]: %s → apontando www-root para %s "
+                "(%d arquivos, %d bytes)",
+                sub_full, sub_choice,
+                sub_manifests[sub_choice][0], sub_manifests[sub_choice][1],
+            )
+            if self.dry_run:
+                self.logger.info(
+                    "[DRY-RUN] %s bin subdomain -u %s -webspace-name %s -www-root %s",
+                    self.plesk_bin, sub_label, parent, sub_choice,
+                )
+                continue
+            self._run(
+                [str(self.plesk_bin), "bin", "subdomain",
+                 "-u", sub_label, "-webspace-name", parent,
+                 "-www-root", sub_choice],
+                timeout=TIMEOUT_FIX_DOCROOT,
+                log_to=report,
+            )
+
+    def _pick_subdomain_docroot(
+        self,
+        manifests: dict[str, tuple[int, int, str]],
+        sub_full: str,
+    ) -> str | None:
+        """Escolhe candidate de subdomain de maior `total_bytes`. Skipa se:
+          - todos vazios (sub ainda sem conteúdo)
+          - canonical (`<sub_full>`) é o único populado E nenhum outro
+            tem hash diferente (= já apontando para o lugar certo)
+          - candidate de maior bytes tem mesmo hash do canonical (= duplicata)
+
+        Retorna `name` (chave relativa, ex.: `webmail` ou `public_html/webmail`)
+        ou `None` se nada deve ser ajustado.
+        """
+        rich = {n: v for n, v in manifests.items() if v[0] > 0}
+        if not rich:
+            return None
+        canonical = sub_full
+        best = max(rich.items(), key=lambda kv: kv[1][1])
+        best_name, (_c, _b, best_hash) = best
+        if best_name == canonical:
+            # Canonical já é o de maior bytes — nada a ajustar.
+            return None
+        canonical_v = manifests.get(canonical)
+        if canonical_v and canonical_v[2] == best_hash:
+            # Outro candidate é apenas duplicata (symlink/hardlink) do canonical.
+            return None
+        return best_name
 
     def fix_mailpath(self, *, apply: bool = False) -> None:
         """Audita onde plesk-migrator depositou Maildirs vs onde o Plesk
@@ -3062,14 +3236,221 @@ class PleskMigrationOrchestrator:
             log_to=self.log_dir / "copy-db.log",
         )
 
+    # plesk-migrator test-all marca rc=1 quando QUALQUER objeto reporta
+    # warning/error, mesmo que sejam todos categorias advisory (source
+    # unreachable, FTP/SSH/DB password encrypted, Apache HTTP code
+    # mismatch). Sem este classifier o pipeline aborta antes de
+    # cleanup-config — operador acaba inspecionando o report manualmente.
+    _TEST_ALL_ADVISORY_PATTERNS = (
+        "The HTTP status code of a web page has changed",
+        "The hosting checker cannot connect",
+        "530 Login incorrect",
+        "User password is encrypted",
+        "Cannot verify access",
+        "Cannot verify the password",
+    )
+
+    def _classify_test_all_report(self) -> tuple[str, dict]:
+        """Lê o último `test_all_report.<ts>` em `<sessions_dir>/<session>/`
+        (preferindo o sufixo timestamp sobre `.json`) e classifica:
+
+          * `ok`   — 0 linhas `error:`.
+          * `soft` — todas as `error:` linhas batem
+                     `_TEST_ALL_ADVISORY_PATTERNS`.
+          * `hard` — pelo menos 1 erro não-mapeado, ou report ausente.
+
+        Retorna `(verdict, summary)` onde `summary` tem:
+          - `error_count`: total de linhas `error:`.
+          - `unmapped_errors`: erros que não bateram nenhum advisory pattern.
+          - `unmapped_samples`: até 5 snippets dos erros unmapped (para log).
+          - `report_path`: path do report usado, ou `""` se ausente.
+          - `reason`: motivo do verdict (para summary file/log).
+        """
+        session_dir = self.sessions_dir / self.session_name
+        # Filtra .json (formato secundário) e .bak; escolhe o sufixo
+        # timestamp lexicograficamente maior (= mais recente).
+        candidates = [
+            p for p in session_dir.glob("test_all_report.*")
+            if p.suffix not in (".json", ".bak")
+        ]
+        if not candidates:
+            return "hard", {
+                "error_count": 0,
+                "unmapped_errors": 0,
+                "unmapped_samples": [],
+                "report_path": "",
+                "reason": "test_all_report.<ts> missing",
+            }
+        report = max(candidates, key=lambda p: p.name)
+        try:
+            text = report.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return "hard", {
+                "error_count": 0,
+                "unmapped_errors": 0,
+                "unmapped_samples": [],
+                "report_path": str(report),
+                "reason": f"could not read report: {exc}",
+            }
+
+        lines = text.splitlines()
+        error_count = 0
+        unmapped_errors = 0
+        unmapped_samples: list[str] = []
+        for idx, raw in enumerate(lines):
+            stripped = raw.strip(" |`-")
+            if not stripped.startswith("error:"):
+                continue
+            error_count += 1
+            # Concatena a primeira linha do erro mais as próximas linhas de
+            # continuação (mesma indentação interna do bloco) — patterns
+            # advisory aparecem no header ou no corpo do erro.
+            block = [stripped[len("error:"):].strip()]
+            for cont in lines[idx + 1: idx + 6]:
+                cs = cont.strip(" |`-")
+                if cs.startswith(("error:", "warning:")) or not cs:
+                    break
+                block.append(cs)
+            blob = " ".join(block)
+            if not any(p in blob for p in self._TEST_ALL_ADVISORY_PATTERNS):
+                unmapped_errors += 1
+                if len(unmapped_samples) < 5:
+                    unmapped_samples.append(blob[:200])
+
+        if error_count == 0:
+            verdict = "ok"
+            reason = "no errors in report"
+        elif unmapped_errors == 0:
+            verdict = "soft"
+            reason = f"{error_count} advisory error(s) — all mapped"
+        else:
+            verdict = "hard"
+            reason = (
+                f"{unmapped_errors} unmapped error(s) of {error_count} total"
+            )
+
+        return verdict, {
+            "error_count": error_count,
+            "unmapped_errors": unmapped_errors,
+            "unmapped_samples": unmapped_samples,
+            "report_path": str(report),
+            "reason": reason,
+        }
+
+    def _write_test_all_summary(self, verdict: str, summary: dict) -> None:
+        """Persiste o resumo da classificação em `<log_dir>/test-all-summary.txt`.
+        OSError é log+swallow (best-effort)."""
+        path = self.log_dir / "test-all-summary.txt"
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            with path.open("w", encoding="utf-8") as fh:
+                fh.write(
+                    f"timestamp={ts}\nverdict={verdict}\n"
+                    f"report_path={summary.get('report_path', '')}\n"
+                    f"error_count={summary.get('error_count', 0)}\n"
+                    f"unmapped_errors={summary.get('unmapped_errors', 0)}\n"
+                    f"reason={summary.get('reason', '')}\n"
+                )
+                samples = summary.get("unmapped_samples") or []
+                if samples:
+                    fh.write("unmapped_samples:\n")
+                    for s in samples:
+                        fh.write(f"  - {s}\n")
+        except OSError as exc:
+            self.logger.warning(
+                "test_all: falha gravando summary em %s: %s", path, exc
+            )
+
     def test_all(self) -> None:
+        """Roda `plesk-migrator test-all` em modo advisory.
+
+        plesk-migrator test-all retorna rc=1 quando QUALQUER objeto reporta
+        warning ou error — mesmo que sejam todos advisory (Apache HTTP
+        mismatch, source unreachable, FTP/SSH/DB password encrypted). Esta
+        fase trata rc=1 com erros 100% mapeados como WARNING (não aborta)
+        e só levanta `PhaseExecutionError` em hard failures:
+          * exit por sinal (rc < 0)
+          * `subprocess.TimeoutExpired` / `OSError` (Plesk inacessível)
+          * report ausente após execução
+          * erros não-mapeados em `_TEST_ALL_ADVISORY_PATTERNS`
+
+        Resumo é gravado em `<log_dir>/test-all-summary.txt`. Output bruto
+        do binário continua em `<log_dir>/test-all.log` para inspeção."""
         self.logger.info("Fase: test_all")
         self._require_plesk_migrator_bin()
         self._require_runtime_state()
-        self._run(
-            [str(self.plesk_migrator_bin), "test-all"],
-            timeout=TIMEOUT_TEST_ALL,
-            log_to=self.log_dir / "test-all.log",
+
+        cmd = [str(self.plesk_migrator_bin), "test-all"]
+        log_path = self.log_dir / "test-all.log"
+        masked = self._mask(" ".join(cmd))
+        self.logger.info("$ %s", masked)
+
+        if self.dry_run:
+            self.logger.info("[DRY-RUN] test_all não executado")
+            return
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT_TEST_ALL,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise PhaseExecutionError(
+                f"test_all: falha ao invocar plesk-migrator: {exc}"
+            ) from exc
+
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"\n--- {masked} (rc={proc.returncode}) ---\n")
+                if proc.stdout:
+                    fh.write(proc.stdout)
+                if proc.stderr:
+                    fh.write("\n--- stderr ---\n")
+                    fh.write(proc.stderr)
+        except OSError as exc:
+            self.logger.warning(
+                "test_all: falha gravando log em %s: %s", log_path, exc
+            )
+
+        if proc.returncode < 0:
+            raise PhaseExecutionError(
+                f"test_all: plesk-migrator killed by signal {-proc.returncode}"
+            )
+
+        verdict, summary = self._classify_test_all_report()
+        # rc=0 sem report → plesk-migrator concluiu sem nada a reportar
+        # (idle/no objects). Trate como ok mesmo que o classifier diga "hard"
+        # por ausência de report.
+        if proc.returncode == 0 and verdict == "hard" and not summary.get("report_path"):
+            verdict = "ok"
+            summary["reason"] = "rc=0 with no report (plesk-migrator idle)"
+        self._write_test_all_summary(verdict, summary)
+
+        if verdict == "ok":
+            self.logger.info(
+                "test_all: report sem erros — pipeline OK (rc=%d)",
+                proc.returncode,
+            )
+            return
+        if verdict == "soft":
+            self.logger.warning(
+                "test_all: rc=%d com %d erro(s) advisory (todos mapeados em "
+                "%s). Resumo: %s. Inspecione %s.",
+                proc.returncode, summary["error_count"],
+                ", ".join(self._TEST_ALL_ADVISORY_PATTERNS),
+                summary["report_path"], log_path,
+            )
+            return
+        # verdict == "hard"
+        samples = "; ".join(summary.get("unmapped_samples") or [])
+        raise PhaseExecutionError(
+            f"test_all: hard failure — {summary['reason']}. "
+            f"Samples: {samples[:500]}. Report: {summary['report_path']}"
         )
 
     def cleanup_config_ini(self) -> None:
@@ -3148,6 +3529,7 @@ class PleskMigrationOrchestrator:
         skip_mail_content: bool = False,
         skip_db_content: bool = False,
         skip_fix_docroot: bool = False,
+        skip_fix_docroot_subdomains: bool = False,
         skip_fix_mailpath: bool = False,
         skip_check_mail_passwords: bool = False,
         reset_mail_passwords: bool = False,
@@ -3183,6 +3565,12 @@ class PleskMigrationOrchestrator:
         skip_fix_docroot = (
             skip_fix_docroot or behavior_skip.get("fix_docroot", False)
         )
+        skip_fix_docroot_subdomains = (
+            skip_fix_docroot_subdomains
+            or behavior_skip.get("fix_docroot_subdomains", False)
+        )
+        # Propaga para o método fix_docroot via attribute (lido com getattr).
+        self.skip_fix_docroot_subdomains = skip_fix_docroot_subdomains
         skip_fix_mailpath = (
             skip_fix_mailpath or behavior_skip.get("fix_mailpath", False)
         )
@@ -3668,6 +4056,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Pula copy-db-content + flag em transfer-accounts")
     parser.add_argument("--skip-fix-docroot", action="store_true",
                         help="Pula ajuste de www-root pós copy-web (fase fix-docroot)")
+    parser.add_argument("--skip-fix-docroot-subdomains", action="store_true",
+                        help="Pula apenas o loop de subdomains dentro de "
+                             "fix-docroot (parents continuam sendo "
+                             "processados)")
     parser.add_argument("--skip-fix-mailpath", action="store_true",
                         help="Pula auditoria de path de Maildir pós copy-mail "
                              "(fase fix-mailpath)")
@@ -3825,6 +4217,7 @@ def main(argv: list[str] | None = None) -> int:
             skip_mail_content=args.skip_mail_content,
             skip_db_content=args.skip_db_content,
             skip_fix_docroot=args.skip_fix_docroot,
+            skip_fix_docroot_subdomains=args.skip_fix_docroot_subdomains,
             skip_fix_mailpath=args.skip_fix_mailpath,
             skip_check_mail_passwords=args.skip_check_mail_passwords,
             reset_mail_passwords=args.reset_mail_passwords,
