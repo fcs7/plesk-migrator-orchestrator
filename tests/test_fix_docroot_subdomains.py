@@ -140,11 +140,15 @@ class FixDocrootSubdomainsTest(unittest.TestCase):
                     if len(c) >= 2 and "subdomain" in c]
         self.assertTrue(sub_cmds, f"expected `plesk bin subdomain` call, got {captured!r}")
         argv = sub_cmds[0]
-        self.assertIn("-u", argv)
+        # plesk bin subdomain --update expects the FULL subdomain name
+        # (e.g., `webmail.opiniao.inf.br`), not the label.
+        self.assertIn("--update", argv)
+        self.assertEqual(
+            argv[argv.index("--update") + 1], "webmail.opiniao.inf.br",
+            "`--update` should receive the full subdomain name",
+        )
         self.assertIn("-webspace-name", argv)
         self.assertEqual(argv[argv.index("-webspace-name") + 1], "opiniao.inf.br")
-        # sub-label is "webmail" (first segment of webmail.opiniao.inf.br)
-        self.assertEqual(argv[argv.index("-u") + 1], "webmail")
         self.assertIn("-www-root", argv)
         www_root = argv[argv.index("-www-root") + 1]
         self.assertNotIn(

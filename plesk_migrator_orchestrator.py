@@ -2407,13 +2407,18 @@ class PleskMigrationOrchestrator:
             )
             if self.dry_run:
                 self.logger.info(
-                    "[DRY-RUN] %s bin subdomain -u %s -webspace-name %s -www-root %s",
-                    self.plesk_bin, sub_label, parent, sub_choice,
+                    "[DRY-RUN] %s bin subdomain --update %s "
+                    "-webspace-name %s -www-root %s",
+                    self.plesk_bin, sub_full, parent, sub_choice,
                 )
                 continue
+            # `plesk bin subdomain --update` espera o NOME COMPLETO do
+            # subdomain (ex.: `cati.opiniao.inf.br`), não o label. Diferente
+            # de `plesk bin subscription -u <dom>` que aceita label-only via
+            # alias. Usamos `--update` explícito para evitar ambiguidade.
             self._run(
                 [str(self.plesk_bin), "bin", "subdomain",
-                 "-u", sub_label, "-webspace-name", parent,
+                 "--update", sub_full, "-webspace-name", parent,
                  "-www-root", sub_choice],
                 timeout=TIMEOUT_FIX_DOCROOT,
                 log_to=report,
