@@ -179,6 +179,7 @@ PHASES_ORDER = [
     "fix-dns-conflicts",
     "copy-db",
     "fix-docroot",
+    "fix-htaccess",
     "test",
     "cleanup-config",
 ]
@@ -387,7 +388,7 @@ class PleskMigrationOrchestrator:
             "web_content", "mail_content", "db_content",
             "fix_docroot", "fix_docroot_subdomains",
             "fix_mailpath", "check_mail_passwords",
-            "fix_ftp_passwords",
+            "fix_ftp_passwords", "fix_htaccess",
             "sanitize_list", "fix_limits", "retransfer_failed",
             "fix_mail_quota", "fix_ftp_renames", "fix_dns_conflicts",
             "fix_owner",
@@ -398,6 +399,7 @@ class PleskMigrationOrchestrator:
             "dry_run", "skip_install", "force_regenerate",
             "cleanup_config", "resume",
             "apply_owner_fix", "apply_dns_cleanup", "apply_mailpath_fix",
+            "apply_htaccess_fix",
             "reset_mail_passwords", "reset_ftp_passwords", "rename_reserved_subdomains",
         ):
             if key in behavior and not isinstance(behavior[key], bool):
@@ -2446,6 +2448,196 @@ class PleskMigrationOrchestrator:
             return None
         return best_name
 
+    # Padrões cPanel-style detectados em .htaccess migrados (confirmados em
+    # produção via Apache `[core:alert] Invalid command 'suPHP_ConfigPath'`).
+    # Cada tupla: (regex_compiled, descrição_humana, marca_categoria).
+    _HTACCESS_PROBLEM_PATTERNS = (
+        # suPHP é módulo cPanel-only; Plesk usa PHP-FPM. Apache rejeita
+        # diretiva desconhecida → erro 500.
+        (re.compile(r"^\s*suPHP_\w+\b", re.IGNORECASE),
+         "suPHP_* directive (cPanel-only module not loaded in Plesk)",
+         "suphp"),
+        # AuthUserFile com path absoluto /home/<user>/... aponta para
+        # diretório que NÃO existe em Plesk.
+        (re.compile(r"^\s*AuthUserFile\s+['\"]?/home/", re.IGNORECASE),
+         "AuthUserFile pointing to /home/... (cPanel layout, missing in Plesk)",
+         "authuserfile-home"),
+        # AuthGroupFile com mesmo problema.
+        (re.compile(r"^\s*AuthGroupFile\s+['\"]?/home/", re.IGNORECASE),
+         "AuthGroupFile pointing to /home/... (cPanel layout)",
+         "authgroupfile-home"),
+        # php_value / php_admin_value são ignorados pelo Plesk PHP-FPM
+        # e podem causar erros em PHP 8+ se forem inválidos.
+        (re.compile(r"^\s*php_(?:admin_)?value\b", re.IGNORECASE),
+         "php_value / php_admin_value (Plesk PHP-FPM ignora htaccess)",
+         "php-value"),
+        # Handlers cPanel-only.
+        (re.compile(
+            r"^\s*Action\s+\S*\s+/cgi-sys/", re.IGNORECASE),
+         "Action ... /cgi-sys/* (cPanel handler)",
+         "cgi-sys"),
+        (re.compile(r"^\s*AddHandler\s+.*(cpanelphp|cgi-script)\b", re.IGNORECASE),
+         "AddHandler cpanelphp/cgi-script (cPanel-only)",
+         "addhandler-cpanel"),
+        (re.compile(r"^\s*FCGIWrapper\s+", re.IGNORECASE),
+         "FCGIWrapper (mod_fcgid cPanel-specific)",
+         "fcgiwrapper"),
+    )
+
+    # Prefixo idempotente para linhas já comentadas pela fase fix-htaccess.
+    _HTACCESS_FIX_PREFIX = "#FIX# "
+
+    def _vhosts_root_for_htaccess(self) -> pathlib.Path:
+        """Hook overridable em testes para apontar para vhost root alternativo
+        (ex.: diretório temporário). Em produção retorna `/var/www/vhosts`."""
+        return pathlib.Path("/var/www/vhosts")
+
+    def fix_htaccess(self, *, apply: bool = False) -> None:
+        """Audita (default) ou reescreve (apply=True) `.htaccess` migrados
+        contendo diretivas cPanel-only que quebram Apache no Plesk.
+
+        Padrões detectados em `_HTACCESS_PROBLEM_PATTERNS`. Audit grava
+        `<log_dir>/htaccess-audit.csv` (header
+        `timestamp,domain,path,line_number,category,snippet`).
+        Apply: comenta linha problemática prefixando `#FIX# `, gera backup
+        `.htaccess.pre-htaccess-fix-<ts>.bak` apenas se houver mudanças
+        (idempotente em re-runs sobre arquivos já fixados).
+
+        OSError em leitura/escrita é log+continue (best-effort, nunca aborta
+        o pipeline). Skip se `_load_migrated_domains` retorna vazio E não há
+        subdomains migrados.
+        """
+        self.logger.info("Fase: fix_htaccess (apply=%s)", apply)
+        parents = self._load_migrated_domains()
+        subs = self._load_migrated_subdomains()
+        if not parents and not subs:
+            self.logger.info(
+                "fix_htaccess: 0 parents/subs migrados — skip"
+            )
+            return
+
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.logger.warning(
+                "fix_htaccess: log_dir mkdir falhou: %s", exc
+            )
+
+        vhosts_root = self._vhosts_root_for_htaccess()
+        domains_seen: set[str] = set()
+        scan_targets: list[tuple[str, pathlib.Path]] = []
+        for parent in parents:
+            if parent in domains_seen:
+                continue
+            domains_seen.add(parent)
+            vhost = vhosts_root / parent
+            if not vhost.is_dir():
+                self.logger.debug(
+                    "fix_htaccess: vhost %s ausente — skip", vhost
+                )
+                continue
+            try:
+                for ht in vhost.rglob(".htaccess"):
+                    scan_targets.append((parent, ht))
+            except OSError as exc:
+                self.logger.warning(
+                    "fix_htaccess: rglob falhou em %s: %s", vhost, exc
+                )
+
+        csv_path = self.log_dir / "htaccess-audit.csv"
+        try:
+            csv_fh = csv_path.open("w", encoding="utf-8")
+            csv_fh.write(
+                "timestamp,domain,path,line_number,category,snippet\n"
+            )
+        except OSError as exc:
+            self.logger.warning(
+                "fix_htaccess: não consegui abrir CSV %s: %s", csv_path, exc
+            )
+            csv_fh = None
+
+        ts_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        ts_compact = _dt.datetime.now(_dt.timezone.utc).strftime(
+            "%Y%m%dT%H%M%SZ"
+        )
+        modified_files = 0
+        flagged_lines = 0
+        for domain, path in scan_targets:
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+            except OSError as exc:
+                self.logger.warning(
+                    "fix_htaccess: leitura falhou %s: %s", path, exc
+                )
+                continue
+
+            new_lines: list[str] = []
+            file_changed = False
+            for idx, raw in enumerate(lines, start=1):
+                stripped = raw.lstrip()
+                if stripped.startswith(self._HTACCESS_FIX_PREFIX):
+                    new_lines.append(raw)
+                    continue
+                matched = False
+                for regex, _desc, category in self._HTACCESS_PROBLEM_PATTERNS:
+                    if regex.search(raw):
+                        flagged_lines += 1
+                        if csv_fh is not None:
+                            snippet = raw.rstrip("\n").replace(",", " ").replace("\"", "'")
+                            if len(snippet) > 200:
+                                snippet = snippet[:200] + "..."
+                            csv_fh.write(
+                                f"{ts_iso},{domain},{path},{idx},"
+                                f"{category},{snippet}\n"
+                            )
+                        if apply:
+                            new_lines.append(self._HTACCESS_FIX_PREFIX + raw)
+                            file_changed = True
+                        else:
+                            new_lines.append(raw)
+                        matched = True
+                        break
+                if not matched:
+                    new_lines.append(raw)
+
+            if apply and file_changed:
+                backup_path = path.with_name(
+                    f".htaccess.pre-htaccess-fix-{ts_compact}.bak"
+                )
+                try:
+                    backup_path.write_text(
+                        "".join(lines), encoding="utf-8"
+                    )
+                    path.write_text("".join(new_lines), encoding="utf-8")
+                    modified_files += 1
+                    self.logger.info(
+                        "fix_htaccess: %s reescrito (backup: %s)",
+                        path, backup_path,
+                    )
+                except OSError as exc:
+                    self.logger.warning(
+                        "fix_htaccess: escrita falhou %s: %s", path, exc
+                    )
+
+        if csv_fh is not None:
+            try:
+                csv_fh.close()
+            except OSError:
+                pass
+
+        if apply:
+            self.logger.info(
+                "fix_htaccess: %d arquivo(s) reescrito(s), %d linha(s) "
+                "comentada(s). Backups em *.pre-htaccess-fix-*.bak.",
+                modified_files, flagged_lines,
+            )
+        else:
+            self.logger.info(
+                "fix_htaccess: audit detectou %d linha(s) problemática(s). "
+                "CSV: %s. Rode com --apply-htaccess-fix para aplicar.",
+                flagged_lines, csv_path,
+            )
+
     def fix_mailpath(self, *, apply: bool = False) -> None:
         """Audita onde plesk-migrator depositou Maildirs vs onde o Plesk
         canonical lê (/var/qmail/mailnames/<dom>/<user>/Maildir/{cur,new,tmp}).
@@ -3547,6 +3739,8 @@ class PleskMigrationOrchestrator:
         apply_mailpath_fix: bool = False,
         skip_fix_owner: bool = False,
         apply_owner_fix: bool = False,
+        skip_fix_htaccess: bool = False,
+        apply_htaccess_fix: bool = False,
         start_from: str | None = None,
     ) -> None:
         behavior = self.config.get("behavior") or {}
@@ -3626,6 +3820,12 @@ class PleskMigrationOrchestrator:
         apply_owner_fix = (
             apply_owner_fix or behavior.get("apply_owner_fix", False)
         )
+        skip_fix_htaccess = (
+            skip_fix_htaccess or behavior_skip.get("fix_htaccess", False)
+        )
+        apply_htaccess_fix = (
+            apply_htaccess_fix or behavior.get("apply_htaccess_fix", False)
+        )
         start_from = start_from or self.start_from or behavior.get("start_from")
 
         if self.resume:
@@ -3694,6 +3894,9 @@ class PleskMigrationOrchestrator:
              not skip_fix_dns_conflicts),
             ("copy-db", self.copy_db_content, not skip_db_content),
             ("fix-docroot", self.fix_docroot, not skip_fix_docroot),
+            ("fix-htaccess",
+             lambda: self.fix_htaccess(apply=apply_htaccess_fix),
+             not skip_fix_htaccess),
             ("test", self.test_all, True),
             ("cleanup-config", self.cleanup_config_ini, self.cleanup_config),
         ]
@@ -4119,6 +4322,16 @@ def _build_parser() -> argparse.ArgumentParser:
                              "reassigna subscription via "
                              "`plesk bin subscription --change-owner <dom> -owner <login>`. "
                              "Distribua senhas via canal seguro fora-de-banda.")
+    parser.add_argument("--skip-fix-htaccess", action="store_true",
+                        help="Pula auditoria/fix de .htaccess cPanel-style "
+                             "(fase fix-htaccess)")
+    parser.add_argument("--apply-htaccess-fix", action="store_true",
+                        help="Em fix-htaccess, reescreve .htaccess "
+                             "comentando diretivas cPanel-only "
+                             "(suPHP_*, AuthUserFile /home/..., php_value, "
+                             "FCGIWrapper, etc) com prefixo '#FIX# '. "
+                             "Backup automático em "
+                             ".htaccess.pre-htaccess-fix-<ts>.bak.")
     parser.add_argument(
         "--resume", action="store_true",
         help="Retoma sessão existente: pula generate-migration-list se já "
@@ -4241,6 +4454,8 @@ def main(argv: list[str] | None = None) -> int:
             apply_mailpath_fix=args.apply_mailpath_fix,
             skip_fix_owner=args.skip_fix_owner,
             apply_owner_fix=args.apply_owner_fix,
+            skip_fix_htaccess=args.skip_fix_htaccess,
+            apply_htaccess_fix=args.apply_htaccess_fix,
             start_from=start_from,
         )
     except LockError as exc:
